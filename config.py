@@ -4,41 +4,82 @@
 """
 
 # 数据源配置
+# 优先级：cninfo(官方，反爬虫温和) > eastmoney(需要严格反爬虫) > sina(备选)
 DATA_SOURCES = {
-    'eastmoney': {
-        'enabled': True,
-        'base_url': 'https://push2.eastmoney.com',
-        'timeout': 30,
-        'weight': 1  # 优先级权重，数字越大优先级越高
-    },
-    'sina': {
-        'enabled': True,
-        'base_url': 'https://money.finance.sina.com.cn',
-        'timeout': 15,
-        'weight': 2
-    },
     'cninfo': {
-        'enabled': False,  # 巨潮资讯网暂时禁用，因为需要更复杂的API调用
+        'enabled': True,  # 巨潮资讯网 - 官方数据源，反爬虫相对温和
         'base_url': 'http://www.cninfo.com.cn',
         'timeout': 20,
-        'weight': 3
+        'weight': 3  # 优先级权重，数字越大优先级越高
+    },
+    'eastmoney': {
+        'enabled': True,  # 东方财富网 - 需要严格的反爬虫处理
+        'base_url': 'https://push2.eastmoney.com',
+        'timeout': 30,
+        'weight': 2
+    },
+    'sina': {
+        'enabled': True,  # 新浪财经 - 备选方案
+        'base_url': 'https://money.finance.sina.com.cn',
+        'timeout': 15,
+        'weight': 1
     }
 }
 
 # 请求配置
 REQUEST_CONFIG = {
-    'delay_between_requests': 0.5,  # 请求间隔(秒)
-    'max_retries': 3,  # 最大重试次数
-    'retry_delay': 2,  # 重试间隔(秒)
+    'delay_between_requests': (0.5, 2.0),  # 请求间隔范围(秒) - 随机延迟
+    'max_retries': 5,  # 最大重试次数
+    'retry_delay': 2,  # 重试基础间隔(秒) - 使用指数退避
     'timeout': 30,  # 默认超时时间
-    'headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/json, text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    }
+    'use_exponential_backoff': True,  # 是否使用指数退避算法
+    'backoff_factor': 2,  # 指数退避因子
+}
+
+# 反爬虫配置 - User-Agent轮换池
+USER_AGENT_POOL = [
+    # Chrome on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+    # Chrome on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    # Firefox on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+    # Firefox on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
+    # Edge on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
+    # Safari on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+]
+
+# HTTP请求头配置
+HEADERS_CONFIG = {
+    'Accept': 'application/json, text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Cache-Control': 'max-age=0',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+}
+
+# 代理配置（可选）
+PROXY_CONFIG = {
+    'enabled': False,  # 是否启用代理
+    'proxies': [
+        # {'http': 'http://proxy1:port', 'https': 'https://proxy1:port'},
+        # {'http': 'http://proxy2:port', 'https': 'https://proxy2:port'},
+    ],
+    'rotate_on_failure': True,  # 失败时是否轮换代理
 }
 
 # 输出配置
