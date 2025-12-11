@@ -45,15 +45,51 @@ class AStockRealEstateDataCollector:
         self.data_2024 = []
         
     def get_stock_list(self) -> List[Dict]:
-        """获取A股全部股票列表"""
+        """获取A股全部股票列表（支持分页获取完整数据）"""
         try:
-            logger.info("获取A股股票列表...")
+            logger.info("开始获取A股股票完整列表...")
             
-            # 使用免费的股票数据API
+            # 尝试从多个数据源获取
+            stock_list = self._get_stock_list_from_eastmoney()
+            
+            # 如果东方财富网获取失败，尝试备用方案
+            if len(stock_list) < 100:
+                logger.warning("东方财富网获取股票列表失败或数量不足，尝试备用方案...")
+                stock_list = self._get_stock_list_backup()
+            
+            if stock_list:
+                logger.info(f"✅ 股票列表获取完成！总计获取 {len(stock_list)} 只股票")
+                
+                # 显示股票代码范围
+                codes = [stock['code'] for stock in stock_list if stock['code']]
+                if codes:
+                    min_code = min(codes)
+                    max_code = max(codes)
+                    logger.info(f"📈 股票代码范围: {min_code} - {max_code}")
+            else:
+                logger.warning("⚠️ 所有数据源都无法获取股票列表，将使用模拟数据进行演示")
+                stock_list = self._generate_demo_stock_list()
+            
+            return stock_list
+                
+        except Exception as e:
+            logger.error(f"获取股票列表失败: {e}")
+            # 返回演示数据
+            return self._generate_demo_stock_list()
+    
+    def _get_stock_list_from_eastmoney(self) -> List[Dict]:
+        """从东方财富网获取股票列表"""
+        try:
             url = "https://push2.eastmoney.com/api/qt/clist/get"
+            page_size = 100
+            stock_list = []
+            total_stocks = 0
+            current_page = 1
+            max_retries = 3
+            retry_delay = 2
+            
             params = {
-                'pn': 1,
-                'pz': 5000,
+                'pz': page_size,
                 'po': 1,
                 'np': 1,
                 'ut': 'bd1d9ddb04089700cf9c27f6f7426281',
@@ -64,30 +100,130 @@ class AStockRealEstateDataCollector:
                 'fields': 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f22,f11,f62,f128,f136,f115,f152'
             }
             
-            response = self.session.get(url, params=params, timeout=30)
-            data = response.json()
+            logger.info(f"尝试从东方财富网获取股票列表...")
             
-            if data.get('data') and data['data'].get('diff'):
-                stock_list = []
-                for item in data['data']['diff']:
-                    stock_info = {
-                        'code': item.get('f12', ''),  # 股票代码
-                        'name': item.get('f14', ''),  # 股票名称
-                        'industry': item.get('f15', ''),  # 行业
-                        'market': item.get('f13', '')  # 市场
-                    }
-                    if stock_info['code'] and stock_info['name']:
-                        stock_list.append(stock_info)
+            while True:
+                retry_count = 0
+                success = False
                 
-                logger.info(f"成功获取{len(stock_list)}只股票信息")
-                return stock_list
-            else:
-                logger.error("无法获取股票列表数据")
-                return []
+                while retry_count < max_retries and not success:
+                    try:
+                        params['pn'] = current_page
+                        
+                        # 添加随机延迟避免被封
+                        if retry_count > 0:
+                            import random
+                            random_delay = random.uniform(1, 3)
+                            time.sleep(random_delay)
+                        
+                        logger.debug(f"正在获取第{current_page}页数据...")
+                        
+                        response = self.session.get(url, params=params, timeout=20)
+                        response.raise_for_status()
+                        
+                        data = response.json()
+                        success = True
+                        
+                        if not data.get('data') or not data['data'].get('diff'):
+                            logger.info(f"第{current_page}页无数据，停止获取")
+                            break
+                        
+                        current_page_stocks = data['data']['diff']
+                        page_stock_count = 0
+                        
+                        for item in current_page_stocks:
+                            stock_info = {
+                                'code': item.get('f12', ''),
+                                'name': item.get('f14', ''),
+                                'industry': item.get('f15', ''),
+                                'market': item.get('f13', '')
+                            }
+                            if stock_info['code'] and stock_info['name']:
+                                stock_list.append(stock_info)
+                                page_stock_count += 1
+                        
+                        if current_page == 1:
+                            total_stocks = data['data'].get('total', len(stock_list))
+                            logger.info(f"检测到总股票数量: {total_stocks}只")
+                        
+                        logger.info(f"第{current_page}页获取到{page_stock_count}只有效股票，累计{len(stock_list)}只")
+                        
+                        if len(stock_list) >= total_stocks or len(current_page_stocks) < page_size:
+                            logger.info("已获取所有股票数据")
+                            break
+                        
+                        current_page += 1
+                        time.sleep(0.5)  # 请求间隔
+                        
+                        if current_page > 55:  # 55页 = 5500只股票
+                            logger.info("达到页数限制，停止获取")
+                            break
+                        
+                        break
+                        
+                    except requests.exceptions.Timeout:
+                        retry_count += 1
+                        logger.warning(f"第{current_page}页请求超时 (尝试{retry_count}/{max_retries})")
+                    except requests.exceptions.ConnectionError:
+                        retry_count += 1
+                        logger.warning(f"第{current_page}页连接错误 (尝试{retry_count}/{max_retries})")
+                    except requests.exceptions.HTTPError as e:
+                        logger.warning(f"第{current_page}页HTTP错误: {e}")
+                        break  # HTTP错误通常是终身的
+                    except Exception as e:
+                        logger.error(f"第{current_page}页处理异常: {e}")
+                        break
+                    
+                    if retry_count < max_retries:
+                        delay = retry_delay * retry_count
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"第{current_page}页请求失败，已达到最大重试次数")
+                        break
                 
+                if not success:
+                    break
+            
+            return stock_list
+            
         except Exception as e:
-            logger.error(f"获取股票列表失败: {e}")
+            logger.error(f"东方财富网获取失败: {e}")
             return []
+    
+    def _get_stock_list_backup(self) -> List[Dict]:
+        """备用股票列表获取方法"""
+        try:
+            # 尝试使用不同的API参数
+            logger.info("尝试备用数据源...")
+            
+            # 这里可以实现其他数据源
+            # 比如新浪财经、腾讯财经等
+            
+            # 目前返回空列表，让主函数使用演示数据
+            return []
+            
+        except Exception as e:
+            logger.error(f"备用数据源获取失败: {e}")
+            return []
+    
+    def _generate_demo_stock_list(self) -> List[Dict]:
+        """生成演示用股票列表"""
+        logger.info("生成演示用股票列表...")
+        
+        demo_stocks = [
+            {'code': '000001', 'name': '平安银行', 'industry': '银行', 'market': '深圳'},
+            {'code': '000002', 'name': '万科A', 'industry': '房地产', 'market': '深圳'},
+            {'code': '000858', 'name': '五粮液', 'industry': '白酒', 'market': '深圳'},
+            {'code': '600036', 'name': '招商银行', 'industry': '银行', 'market': '上海'},
+            {'code': '600519', 'name': '贵州茅台', 'industry': '白酒', 'market': '上海'},
+            {'code': '600887', 'name': '伊利股份', 'industry': '乳业', 'market': '上海'},
+            {'code': '000725', 'name': '京东方A', 'industry': '显示面板', 'market': '深圳'},
+            {'code': '300059', 'name': '东方财富', 'industry': '金融科技', 'market': '深圳'},
+            {'code': '002415', 'name': '海康威视', 'industry': '安防监控', 'market': '深圳'},
+            {'code': '300750', 'name': '宁德时代', 'industry': '锂电池', 'market': '深圳'}
+        ]
+        
+        return demo_stocks
     
     def search_real_estate_data(self, stock_code: str, stock_name: str) -> Dict:
         """搜索特定股票的非经营性房地产数据"""
@@ -375,9 +511,11 @@ class AStockRealEstateDataCollector:
     def run(self, max_stocks: int = 100):
         """执行数据收集主流程"""
         logger.info("开始A股非经营性房地产资产数据收集...")
+        start_time = time.time()
         
         try:
             # 1. 获取股票列表
+            print("\n🔍 第1步：获取股票列表...")
             stock_list = self.get_stock_list()
             if not stock_list:
                 logger.error("无法获取股票列表，程序退出")
@@ -386,31 +524,78 @@ class AStockRealEstateDataCollector:
             # 限制处理数量（用于测试）
             if max_stocks > 0:
                 stock_list = stock_list[:max_stocks]
+                print(f"📝 测试模式：限制处理前{max_stocks}只股票")
+            
+            print(f"✅ 股票列表获取完成，共{len(stock_list)}只股票")
             
             # 2. 逐个获取股票数据
+            print(f"\n🔍 第2步：获取房地产资产数据...")
             all_data = []
+            
+            # 计算预计完成时间
+            estimated_time = len(stock_list) * 0.5  # 每只股票0.5秒
+            print(f"⏱️ 预计需要时间: {estimated_time:.1f}秒")
+            
             for i, stock in enumerate(stock_list):
-                logger.info(f"正在处理 {i+1}/{len(stock_list)}: {stock['code']} - {stock['name']}")
+                # 计算进度百分比
+                progress = (i + 1) / len(stock_list) * 100
                 
-                data = self.search_real_estate_data(stock['code'], stock['name'])
-                data.update(stock)  # 合并基本信息
-                all_data.append(data)
+                # 显示进度信息
+                if i == 0:
+                    print(f"\n📊 开始处理股票数据...")
+                
+                if (i + 1) % 10 == 0 or i == 0:
+                    elapsed_time = time.time() - start_time
+                    avg_time_per_stock = elapsed_time / (i + 1) if i > 0 else 0
+                    remaining_time = avg_time_per_stock * (len(stock_list) - i - 1)
+                    
+                    print(f"🔄 进度: {i+1}/{len(stock_list)} ({progress:.1f}%) - "
+                          f"剩余时间约{remaining_time:.0f}秒 - "
+                          f"{stock['code']} {stock['name']}")
+                elif (i + 1) % 50 == 0:
+                    # 每50只股票显示详细进度
+                    logger.info(f"已处理 {i+1} 只股票，进度 {progress:.1f}%")
+                
+                try:
+                    data = self.search_real_estate_data(stock['code'], stock['name'])
+                    data.update(stock)  # 合并基本信息
+                    all_data.append(data)
+                except Exception as e:
+                    logger.warning(f"获取股票 {stock['code']} 数据失败: {e}")
+                    # 跳过失败的数据
+                    continue
                 
                 # 添加延迟避免请求过于频繁
-                time.sleep(0.5)
+                time.sleep(0.3)  # 稍微减少延迟提高速度
                 
-                # 每100个股票保存一次中间结果
-                if (i + 1) % 100 == 0:
-                    logger.info(f"已处理 {i+1} 只股票，保存中间结果...")
+                # 每500个股票保存一次中间结果（如果处理大量数据）
+                if (i + 1) % 500 == 0:
+                    print(f"💾 已处理 {i+1} 只股票，保存中间结果...")
+                    try:
+                        temp_data = self.clean_and_validate_data(all_data)
+                        temp_file = f"temp_result_{i+1}.xlsx"
+                        self.export_to_excel(temp_data, temp_file)
+                        print(f"✅ 中间结果已保存到: {temp_file}")
+                    except Exception as e:
+                        logger.warning(f"保存中间结果失败: {e}")
+            
+            print(f"\n✅ 股票数据获取完成，共获取{len(all_data)}只股票的有效数据")
             
             # 3. 数据清洗和验证
+            print("\n🧹 第3步：数据清洗和验证...")
             cleaned_data = self.clean_and_validate_data(all_data)
+            print(f"✅ 数据清洗完成，有效数据{len(cleaned_data)}条")
             
             # 4. 导出到Excel
+            print("\n📊 第4步：导出Excel文件...")
             output_file = self.export_to_excel(cleaned_data)
             
-            logger.info(f"数据收集完成！共处理 {len(cleaned_data)} 只股票")
-            logger.info(f"输出文件: {output_file}")
+            # 计算总用时
+            total_time = time.time() - start_time
+            print(f"\n🎉 数据收集完成！")
+            print(f"⏰ 总用时: {total_time:.1f}秒")
+            print(f"📊 处理股票: {len(cleaned_data)}只")
+            print(f"📄 输出文件: {output_file}")
             
             return output_file
             
@@ -422,26 +607,69 @@ class AStockRealEstateDataCollector:
 def main():
     """主函数"""
     print("=" * 60)
-    print("A股非经营性房地产资产数据获取脚本")
+    print("🏢 A股非经营性房地产资产数据获取脚本")
+    print("🔄 完整股票列表获取 + Excel导出")
     print("=" * 60)
     
     # 创建数据收集器
     collector = AStockRealEstateDataCollector()
     
     try:
+        # 询问用户是否要处理全部股票还是测试模式
+        print("📋 请选择运行模式:")
+        print("1. 测试模式 (处理10只股票)")
+        print("2. 完整模式 (处理全部股票，可能需要较长时间)")
+        print("3. 自定义数量")
+        
+        try:
+            choice = input("\n请输入选择 (1/2/3, 默认1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n使用默认测试模式...")
+            choice = "1"
+        
+        if choice == "2":
+            max_stocks = 0  # 0表示处理全部股票
+            print("🚀 已选择完整模式，将处理全部股票...")
+        elif choice == "3":
+            try:
+                max_stocks = int(input("请输入要处理的股票数量: "))
+                print(f"📊 将处理{max_stocks}只股票")
+            except (ValueError, EOFError, KeyboardInterrupt):
+                print("使用默认测试模式...")
+                max_stocks = 10
+        else:
+            max_stocks = 10  # 默认测试模式
+            print("🧪 已选择测试模式，将处理10只股票")
+        
+        print("\n" + "=" * 60)
+        print("开始执行数据收集...")
+        print("=" * 60)
+        
         # 执行数据收集
-        # 设置max_stocks=0表示处理全部股票，设为正数表示限制处理数量（用于测试）
-        output_file = collector.run(max_stocks=10)  # 测试时只处理10只股票
+        output_file = collector.run(max_stocks=max_stocks)
         
         if output_file:
-            print(f"\n✅ 数据收集成功完成！")
+            print("\n" + "=" * 60)
+            print("✅ 数据收集成功完成！")
             print(f"📄 输出文件: {output_file}")
             print(f"📊 处理股票数量: 查看Excel文件中的统计信息")
+            print("=" * 60)
+            
+            # 显示文件信息
+            try:
+                import os
+                if os.path.exists(output_file):
+                    file_size = os.path.getsize(output_file)
+                    print(f"📈 文件大小: {file_size:,} 字节")
+            except:
+                pass
+                
         else:
             print("\n❌ 数据收集失败，请检查日志信息")
             
     except KeyboardInterrupt:
         print("\n⚠️ 用户中断操作")
+        print("程序已安全退出")
     except Exception as e:
         print(f"\n❌ 程序执行出错: {e}")
         logger.error(f"主程序异常: {e}")
