@@ -23,7 +23,7 @@ A股非经营性房地产资产数据获取脚本
 
 作者：Claude
 日期：2024
-版本：2.1.0 - 申万行业分类数据获取 + 缓存机制 + 行业分类关联
+版本：2.3.0 - 紧急修复：多数据源补全机制 + AkShare + 网页爬虫 + 严格验证
 """
 
 import pandas as pd
@@ -242,21 +242,118 @@ class AStockRealEstateDataCollector:
         logger.error(f"请求失败，已达最大重试次数: {url}")
         return None
         
+    def validate_stock_code(self, code: str) -> bool:
+        """
+        严格验证股票代码格式
+        
+        只接受真实A股代码：
+        - 6开头：沪市主板
+        - 0开头：深市主板/中小板
+        - 3开头：创业板
+        - 8开头：北交所
+        - 4开头：北交所
+        
+        拒绝：
+        - 920000等错误代码
+        - 非6位数字
+        """
+        if not isinstance(code, str) or len(code) != 6:
+            return False
+        
+        # 只接受有效的A股代码
+        valid_first_digits = {'6', '0', '3', '8', '4'}
+        if code[0] not in valid_first_digits:
+            logger.debug(f"❌ 无效代码 {code}（第一位是{code[0]}，不是A股代码）")
+            return False
+        
+        # 确保后面都是数字
+        if not code[1:].isdigit():
+            logger.debug(f"❌ 无效代码 {code}（包含非数字字符）")
+            return False
+        
+        # 特殊拒绝列表（错误数据）
+        invalid_prefixes = ['920', '921', '922']
+        if any(code.startswith(prefix) for prefix in invalid_prefixes):
+            logger.warning(f"❌ 拒绝错误代码 {code}（错误前缀）")
+            return False
+        
+        return True
+    
     def get_stock_list(self) -> List[Dict]:
-        """获取A股全部股票列表（支持分页获取完整数据）"""
+        """
+        获取A股全部股票列表 - 多数据源补全机制
+        
+        优先级顺序：
+        1. AkShare（最可靠）
+        2. 巨潮资讯网页爬虫
+        3. 同花顺网页爬虫
+        4. 东方财富API
+        5. 其他备用方案
+        """
         try:
-            logger.info("开始获取A股股票完整列表...")
+            logger.info("="*80)
+            logger.info("🚀 开始获取A股股票完整列表 - 多数据源补全机制")
+            logger.info("="*80)
             
-            # 尝试从多个数据源获取
-            stock_list = self._get_stock_list_from_eastmoney()
+            all_stocks = {}  # code -> stock_info（去重）
             
-            # 如果东方财富网获取失败，尝试备用方案
-            if len(stock_list) < 100:
-                logger.warning("东方财富网获取股票列表失败或数量不足，尝试备用方案...")
-                stock_list = self._get_stock_list_backup()
+            # 定义数据源优先级（从最可靠到备用）
+            sources = [
+                ('腾讯财经API', self._get_stock_list_from_tencent),
+                ('网易财经CSV', self._get_stock_list_from_netease_csv),
+                ('AkShare', self._get_stock_list_from_akshare),
+                ('巨潮资讯爬虫', self._get_stock_list_from_cninfo_crawler),
+                ('同花顺爬虫', self._get_stock_list_from_ths_crawler),
+                ('东方财富API', self._get_stock_list_from_eastmoney),
+                ('其他备用源', self._get_stock_list_backup),
+            ]
+            
+            # 尝试各数据源
+            for source_name, fetch_func in sources:
+                try:
+                    logger.info(f"\n{'─'*60}")
+                    logger.info(f"🔍 尝试数据源: {source_name}")
+                    logger.info(f"{'─'*60}")
+                    
+                    stocks = fetch_func()
+                    
+                    if not stocks:
+                        logger.warning(f"❌ [{source_name}] 未获取到数据，继续下一个源...")
+                        continue
+                    
+                    # 验证代码格式并去重
+                    valid_count = 0
+                    invalid_count = 0
+                    for stock in stocks:
+                        code = stock.get('code', '')
+                        if self.validate_stock_code(code):
+                            if code not in all_stocks:
+                                all_stocks[code] = stock
+                                valid_count += 1
+                        else:
+                            invalid_count += 1
+                    
+                    logger.info(f"✅ [{source_name}] 新增 {valid_count} 个有效股票")
+                    if invalid_count > 0:
+                        logger.warning(f"⚠️  [{source_name}] 过滤掉 {invalid_count} 个无效代码")
+                    logger.info(f"📊 当前总计: {len(all_stocks)} 个股票")
+                    
+                    # 如果已获取足够数据，停止
+                    if len(all_stocks) >= 5000:
+                        logger.info(f"\n🎉 已获取 {len(all_stocks)} 个股票，达到目标！")
+                        break
+                    
+                except Exception as e:
+                    logger.error(f"❌ [{source_name}] 获取失败: {e}")
+                    continue
+            
+            # 转换为列表
+            stock_list = list(all_stocks.values())
             
             if stock_list:
+                logger.info(f"\n{'='*80}")
                 logger.info(f"✅ 股票列表获取完成！总计获取 {len(stock_list)} 只股票")
+                logger.info(f"{'='*80}")
                 
                 # 验证和统计股票列表
                 self._validate_and_report_stock_list(stock_list)
@@ -311,6 +408,449 @@ class AStockRealEstateDataCollector:
         min_code = min(codes)
         max_code = max(codes)
         logger.info(f"📈 股票代码范围: {min_code} - {max_code}")
+    
+    def _get_stock_list_from_tencent(self) -> List[Dict]:
+        """
+        从腾讯财经API获取股票列表（最稳定可靠）
+        
+        腾讯财经API通常比较稳定，而且数据完整
+        """
+        try:
+            logger.info("正在从腾讯财经API获取股票列表...")
+            
+            stock_list = []
+            
+            # 腾讯财经的股票列表API
+            # 分为沪市(sh)和深市(sz)
+            markets = [
+                ('sh', '上海'),
+                ('sz', '深圳'),
+            ]
+            
+            for market_code, market_name in markets:
+                try:
+                    logger.info(f"正在获取{market_name}股票...")
+                    
+                    # 腾讯财经股票列表接口
+                    url = f"http://qt.gtimg.cn/q={market_code}000001"
+                    
+                    # 实际上，腾讯财经有一个更好的接口
+                    # 我们使用股票列表的JSON格式
+                    list_url = f"http://qt.gtimg.cn/q=s_{market_code}all"
+                    
+                    response = self._make_request(list_url)
+                    if not response:
+                        logger.warning(f"{market_name}请求失败")
+                        continue
+                    
+                    # 解析返回数据
+                    text = response.text
+                    
+                    # 腾讯返回格式: v_s_shall="sh600000~浦发银行~..."
+                    # 提取股票代码
+                    import re
+                    
+                    # 匹配所有股票代码
+                    pattern = rf'{market_code}(\d{{6}})'
+                    matches = re.findall(pattern, text)
+                    
+                    logger.info(f"{market_name}找到{len(matches)}个匹配")
+                    
+                    for code in matches:
+                        full_code = code  # 6位代码
+                        if len(full_code) == 6:
+                            stock_info = {
+                                'code': full_code,
+                                'name': '',  # 名称需要后续查询
+                                'industry': '',
+                                'market': market_name
+                            }
+                            stock_list.append(stock_info)
+                    
+                except Exception as market_error:
+                    logger.warning(f"{market_name}获取失败: {market_error}")
+                    continue
+            
+            # 如果腾讯的第一个方法失败，尝试另一个接口
+            if len(stock_list) < 100:
+                logger.info("尝试腾讯财经备用接口...")
+                
+                # 备用方法：使用腾讯的板块数据
+                for page in range(1, 200):  # 最多200页
+                    try:
+                        url = "http://stock.gtimg.cn/data/index.php"
+                        params = {
+                            'appn': 'rank',
+                            't': 'ranka/chr',
+                            'p': page,
+                            'o': 0,
+                            'l': 40,
+                            'v': 'list_data'
+                        }
+                        
+                        response = self._make_request(url, params=params)
+                        if not response:
+                            break
+                        
+                        try:
+                            data = response.json()
+                            if not data or 'data' not in data:
+                                break
+                            
+                            items = data['data']
+                            if not items:
+                                break
+                            
+                            for item in items:
+                                code = item.get('code', '')
+                                name = item.get('name', '')
+                                
+                                if len(code) == 6 and code.isdigit():
+                                    stock_info = {
+                                        'code': code,
+                                        'name': name,
+                                        'industry': '',
+                                        'market': '上海' if code.startswith('6') else '深圳'
+                                    }
+                                    stock_list.append(stock_info)
+                            
+                            logger.info(f"第{page}页: 新增{len(items)}只，累计{len(stock_list)}只")
+                            
+                            if len(stock_list) >= 5000:
+                                break
+                            
+                        except:
+                            break
+                    
+                    except:
+                        break
+            
+            if stock_list:
+                logger.info(f"✅ 从腾讯财经获取 {len(stock_list)} 只股票")
+            else:
+                logger.warning("❌ 腾讯财经未获取到数据")
+            
+            return stock_list
+            
+        except Exception as e:
+            logger.error(f"腾讯财经获取失败: {e}")
+            return []
+    
+    def _get_stock_list_from_netease_csv(self) -> List[Dict]:
+        """
+        从网易财经CSV数据获取股票列表（非常可靠）
+        
+        网易财经提供CSV格式的股票数据下载，格式稳定
+        """
+        try:
+            logger.info("正在从网易财经CSV获取股票列表...")
+            
+            import io
+            
+            stock_list = []
+            
+            # 网易财经提供的A股股票列表CSV
+            # 沪市
+            urls = [
+                ('http://quotes.money.163.com/service/chddata.html?code=0000001&start=19900101&end=20991231&fields=TCLOSE', '沪市'),
+                ('http://quotes.money.163.com/service/chddata.html?code=1000001&start=19900101&end=20991231&fields=TCLOSE', '深市'),
+            ]
+            
+            # 使用网易的股票列表API（分页）
+            for page in range(0, 100):  # 最多100页
+                try:
+                    url = f"http://quotes.money.163.com/hs/service/diyrank.php"
+                    params = {
+                        'page': page,
+                        'count': 5000,
+                        'type': 'query',
+                        'fields': 'SYMBOL,NAME,PRICE',
+                        'query': 'STYPE:EQA',
+                        'sort': 'SYMBOL',
+                        'order': 'asc'
+                    }
+                    
+                    response = self._make_request(url, params=params)
+                    if not response:
+                        if page == 0:
+                            logger.warning("网易财经请求失败")
+                            break
+                        else:
+                            logger.info(f"已获取{page}页数据，停止")
+                            break
+                    
+                    # 网易返回CSV格式
+                    try:
+                        df = pd.read_csv(io.StringIO(response.text))
+                        
+                        if df is None or len(df) == 0:
+                            logger.info(f"第{page}页无数据")
+                            break
+                        
+                        for idx, row in df.iterrows():
+                            try:
+                                symbol = str(row.get('SYMBOL', ''))
+                                name = str(row.get('NAME', ''))
+                                
+                                # 解析代码（网易格式可能是0600000或1000001）
+                                if symbol.startswith('0') or symbol.startswith('1'):
+                                    code = symbol[1:]  # 去掉第一位
+                                else:
+                                    code = symbol
+                                
+                                if len(code) == 6 and code.isdigit():
+                                    stock_info = {
+                                        'code': code,
+                                        'name': name,
+                                        'industry': '',
+                                        'market': '上海' if code.startswith('6') else '深圳'
+                                    }
+                                    stock_list.append(stock_info)
+                            except:
+                                continue
+                        
+                        logger.info(f"第{page}页: 获取{len(df)}条，累计{len(stock_list)}只")
+                        
+                        if len(stock_list) >= 5000:
+                            logger.info("已获取足够数据")
+                            break
+                        
+                    except Exception as parse_error:
+                        logger.debug(f"第{page}页解析失败: {parse_error}")
+                        if page == 0:
+                            break
+                        else:
+                            break
+                    
+                except Exception as page_error:
+                    logger.debug(f"第{page}页获取失败: {page_error}")
+                    break
+            
+            if stock_list:
+                logger.info(f"✅ 从网易财经CSV获取 {len(stock_list)} 只股票")
+            else:
+                logger.warning("❌ 网易财经CSV未获取到数据")
+            
+            return stock_list
+            
+        except Exception as e:
+            logger.error(f"网易财经CSV获取失败: {e}")
+            return []
+    
+    def _get_stock_list_from_akshare(self) -> List[Dict]:
+        """
+        从AkShare获取A股股票列表（最推荐的方案）
+        
+        优点：
+        - 开源免费，无需注册
+        - 数据完整准确（支持5000+股票）
+        - 不易被限流
+        - 接口稳定
+        
+        注意：如果网络不稳定可能会失败，但有其他备用数据源
+        """
+        try:
+            logger.info("正在从AkShare获取A股股票列表...")
+            
+            try:
+                import akshare as ak
+            except ImportError:
+                logger.error("❌ AkShare未安装，请运行: pip install akshare")
+                return []
+            
+            stock_list = []
+            
+            # AkShare提供多个接口，尝试多个
+            methods = [
+                ('stock_zh_a_spot_em', 'A股实时行情（东方财富）'),
+                ('stock_info_a_code_name', 'A股代码和名称'),
+                ('stock_zh_a_spot', 'A股实时行情（新浪）'),
+            ]
+            
+            for method_name, desc in methods:
+                try:
+                    logger.info(f"尝试AkShare方法: {desc}...")
+                    
+                    if not hasattr(ak, method_name):
+                        logger.debug(f"方法 {method_name} 不存在，跳过")
+                        continue
+                    
+                    method = getattr(ak, method_name)
+                    df = method()
+                    
+                    if df is None or len(df) == 0:
+                        logger.warning(f"{desc} 返回空数据")
+                        continue
+                    
+                    logger.info(f"{desc} 返回 {len(df)} 条记录，正在解析...")
+                    
+                    # 解析数据（字段名可能不同）
+                    for idx, row in df.iterrows():
+                        try:
+                            # 尝试不同的字段名
+                            code = str(row.get('代码', row.get('code', row.get('symbol', ''))))
+                            name = str(row.get('名称', row.get('name', '')))
+                            
+                            # 确保代码是6位
+                            if len(code) == 6 and code.isdigit():
+                                stock_info = {
+                                    'code': code,
+                                    'name': name,
+                                    'industry': '',
+                                    'market': '上海' if code.startswith('6') else '深圳'
+                                }
+                                stock_list.append(stock_info)
+                        except Exception as e:
+                            logger.debug(f"解析行失败: {e}")
+                            continue
+                    
+                    if len(stock_list) >= 100:
+                        logger.info(f"✅ 从AkShare成功获取 {len(stock_list)} 只股票")
+                        return stock_list
+                    
+                except Exception as method_error:
+                    logger.debug(f"{desc} 异常: {method_error}")
+                    # 即使有异常，也检查是否获取到了部分数据
+                    if len(stock_list) >= 100:
+                        logger.info(f"✅ 从AkShare获取 {len(stock_list)} 只股票（部分方法成功）")
+                        return stock_list
+                    continue
+            
+            # 如果所有方法都失败了，但获取到了一些数据
+            if stock_list:
+                logger.info(f"✅ 从AkShare获取到 {len(stock_list)} 只股票")
+                return stock_list
+            else:
+                logger.warning("❌ AkShare所有方法都失败")
+                return []
+            
+        except Exception as e:
+            logger.error(f"AkShare获取失败: {e}")
+            return []
+    
+    def _get_stock_list_from_cninfo_crawler(self) -> List[Dict]:
+        """
+        从巨潮资讯网页爬取A股上市公司列表
+        
+        巨潮资讯是中国证监会指定的信息披露网站，数据最权威
+        """
+        try:
+            logger.info("正在从巨潮资讯爬取股票列表...")
+            
+            from bs4 import BeautifulSoup
+            
+            stock_list = []
+            
+            # 巨潮资讯的上市公司列表API
+            url = "http://www.cninfo.com.cn/new/data/szse_stock.json"
+            
+            response = self._make_request(url)
+            if not response:
+                logger.warning("巨潮资讯请求失败")
+                return []
+            
+            try:
+                data = response.json()
+                
+                if isinstance(data, dict) and 'stockList' in data:
+                    stock_data = data['stockList']
+                elif isinstance(data, list):
+                    stock_data = data
+                else:
+                    logger.warning("巨潮资讯返回数据格式不正确")
+                    return []
+                
+                for item in stock_data:
+                    code = item.get('code', '')
+                    name = item.get('name', '') or item.get('orgCName', '')
+                    
+                    if code and name:
+                        stock_info = {
+                            'code': code,
+                            'name': name,
+                            'industry': '',
+                            'market': '上海' if code.startswith('6') else '深圳'
+                        }
+                        stock_list.append(stock_info)
+                
+                logger.info(f"✅ 从巨潮资讯获取 {len(stock_list)} 只股票")
+                return stock_list
+                
+            except Exception as e:
+                logger.warning(f"巨潮资讯数据解析失败: {e}")
+                return []
+            
+        except Exception as e:
+            logger.error(f"巨潮资讯爬虫失败: {e}")
+            return []
+    
+    def _get_stock_list_from_ths_crawler(self) -> List[Dict]:
+        """
+        从同花顺爬取股票列表
+        
+        同花顺是知名的财经数据平台，数据比较完整
+        """
+        try:
+            logger.info("正在从同花顺爬取股票列表...")
+            
+            stock_list = []
+            
+            # 同花顺股票列表API
+            url = "http://q.10jqka.com.cn/index/index/board/all/field/zdf/order/desc/page/1/ajax/1/"
+            
+            response = self._make_request(
+                url,
+                referer='http://q.10jqka.com.cn/'
+            )
+            
+            if not response:
+                logger.warning("同花顺请求失败")
+                return []
+            
+            try:
+                from bs4 import BeautifulSoup
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # 查找股票表格
+                table = soup.find('table', class_='m-table')
+                if not table:
+                    logger.warning("同花顺未找到股票表格")
+                    return []
+                
+                rows = table.find_all('tr')[1:]  # 跳过表头
+                
+                for row in rows:
+                    try:
+                        cols = row.find_all('td')
+                        if len(cols) >= 3:
+                            code = cols[1].text.strip()
+                            name = cols[2].text.strip()
+                            
+                            if code and name:
+                                stock_info = {
+                                    'code': code,
+                                    'name': name,
+                                    'industry': '',
+                                    'market': '上海' if code.startswith('6') else '深圳'
+                                }
+                                stock_list.append(stock_info)
+                    except:
+                        continue
+                
+                logger.info(f"✅ 从同花顺获取 {len(stock_list)} 只股票")
+                
+                # 同花顺单页数据较少，如果有需要可以分页
+                # 但作为备用源，少量数据也可以接受
+                return stock_list
+                
+            except Exception as e:
+                logger.warning(f"同花顺数据解析失败: {e}")
+                return []
+            
+        except Exception as e:
+            logger.error(f"同花顺爬虫失败: {e}")
+            return []
     
     def _get_stock_list_from_eastmoney(self) -> List[Dict]:
         """从东方财富网获取股票列表（带反爬虫处理和完整分页）"""
