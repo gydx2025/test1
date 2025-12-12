@@ -237,10 +237,15 @@ class AStockRealEstateDataCollector:
         try:
             logger.info("开始获取A股股票完整列表...")
             
-            # 尝试从多个数据源获取
-            stock_list = self._get_stock_list_from_eastmoney()
+            # 优先级1：巨潮资讯 (cninfo)
+            stock_list = self._get_stock_list_from_cninfo()
             
-            # 如果东方财富网获取失败，尝试备用方案
+            # 优先级2：东方财富网 (eastmoney)
+            if len(stock_list) < 100:
+                logger.warning("巨潮资讯获取股票列表失败或数量不足，尝试东方财富网...")
+                stock_list = self._get_stock_list_from_eastmoney()
+            
+            # 优先级3：备用方案 (tushare/sina)
             if len(stock_list) < 100:
                 logger.warning("东方财富网获取股票列表失败或数量不足，尝试备用方案...")
                 stock_list = self._get_stock_list_backup()
@@ -265,10 +270,69 @@ class AStockRealEstateDataCollector:
             # 返回演示数据
             return self._generate_demo_stock_list()
     
+    def _get_stock_list_from_cninfo(self) -> List[Dict]:
+        """从巨潮资讯获取股票列表"""
+        try:
+            url = "http://www.cninfo.com.cn/new/data/szse_stock.json"
+            logger.info("🔍 开始从巨潮资讯(cninfo)获取完整股票列表...")
+            
+            response = self._make_request(url, referer='http://www.cninfo.com.cn/new/common/szse_stock')
+            
+            if not response:
+                logger.error("巨潮资讯请求失败")
+                return []
+                
+            try:
+                data = response.json()
+            except Exception as json_error:
+                logger.error(f"巨潮资讯JSON解析失败: {json_error}")
+                return []
+                
+            if not data.get('stockList'):
+                logger.warning("巨潮资讯返回数据格式不正确")
+                return []
+                
+            stock_list = []
+            raw_list = data['stockList']
+            
+            logger.info(f"📈 巨潮资讯返回原始数据: {len(raw_list)}条")
+            
+            for item in raw_list:
+                # 过滤非A股
+                if item.get('category') != 'A股':
+                    continue
+                    
+                code = item.get('code', '')
+                if not code:
+                    continue
+                    
+                # 确定市场
+                market = '深圳'
+                if code.startswith('6') or code.startswith('9') or code.startswith('5') or code.startswith('7'):
+                    market = '上海'
+                elif code.startswith('8') or code.startswith('4'):
+                    market = '北京'
+                
+                stock_info = {
+                    'code': code,
+                    'name': item.get('zwjc', ''),
+                    'industry': '未知', # 巨潮列表不包含详细行业，后续会获取
+                    'market': market
+                }
+                stock_list.append(stock_info)
+            
+            logger.info(f"✅ 巨潮资讯获取完成: 有效A股 {len(stock_list)} 只")
+            return stock_list
+            
+        except Exception as e:
+            logger.error(f"巨潮资讯获取失败: {e}")
+            return []
+
     def _get_stock_list_from_eastmoney(self) -> List[Dict]:
         """从东方财富网获取股票列表（带反爬虫处理和完整分页）"""
         try:
-            url = "https://push2.eastmoney.com/api/qt/clist/get"
+            # 使用push2delay域名，避免重定向问题
+            url = "https://push2delay.eastmoney.com/api/qt/clist/get"
             page_size = 100  # 每页100只股票
             stock_list = []
             total_stocks = 0
@@ -480,6 +544,97 @@ class AStockRealEstateDataCollector:
         
         return demo_stocks
     
+    def _preload_industry_cache(self):
+        """预加载行业分类缓存（从东方财富列表接口批量获取）"""
+        try:
+            # 如果缓存已经足够丰富，跳过预加载
+            if len(self.industry_cache) > 4000:
+                logger.info(f"行业分类缓存已有 {len(self.industry_cache)} 条数据，跳过预加载")
+                return
+
+            logger.info("正在预加载行业分类数据...")
+            url = "https://push2delay.eastmoney.com/api/qt/clist/get"
+            page_size = 100
+            current_page = 1
+            total_fetched = 0
+            
+            # 字段: f12(代码), f14(名称), f100(行业板块)
+            params = {
+                'pz': page_size,
+                'po': 1,
+                'np': 1,
+                'ut': 'bd1d9ddb04089700cf9c27f6f7426281',
+                'fltt': 2,
+                'invt': 2,
+                'fid': 'f3',
+                'fs': 'm:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23',
+                'fields': 'f12,f14,f100,f102,f103',
+                'pn': 1
+            }
+            
+            # 获取总数
+            response = self._make_request(url, params=params)
+            if not response:
+                return
+                
+            data = response.json()
+            total_stocks = data.get('data', {}).get('total', 0)
+            
+            if total_stocks == 0:
+                return
+                
+            logger.info(f"发现 {total_stocks} 条行业数据，开始批量获取...")
+            
+            # 批量获取
+            with tqdm(total=total_stocks, desc="加载行业数据", unit="只") as pbar:
+                while True:
+                    params['pn'] = current_page
+                    
+                    response = self._make_request(url, params=params)
+                    if not response:
+                        break
+                        
+                    try:
+                        data = response.json()
+                        diff = data.get('data', {}).get('diff', [])
+                        if not diff:
+                            break
+                            
+                        for item in diff:
+                            code = item.get('f12')
+                            if code == '000001':
+                                print(f'DEBUG: Found 000001. f100={item.get('f100')}')
+                            industry = item.get('f100')
+                            
+                            if code and industry:
+                                # 如果缓存中没有该股票，或者缓存中没有行业信息
+                                if code not in self.industry_cache:
+                                    self.industry_cache[code] = {
+                                        'shenwan_level1': industry, # 使用东财行业作为一级行业回退
+                                        'shenwan_level2': industry,
+                                        'shenwan_level3': industry,
+                                        'industry': industry,
+                                        'source': 'eastmoney_list'
+                                    }
+                                    
+                        total_fetched += len(diff)
+                        pbar.update(len(diff))
+                        
+                        if len(diff) < page_size or total_fetched >= total_stocks:
+                            break
+                            
+                        current_page += 1
+                        
+                    except Exception as e:
+                        logger.error(f"解析行业数据失败: {e}")
+                        break
+            
+            logger.info(f"行业数据加载完成，缓存了 {len(self.industry_cache)} 只股票的行业信息")
+            self._save_industry_cache()
+            
+        except Exception as e:
+            logger.error(f"预加载行业数据失败: {e}")
+
     def _load_industry_cache(self):
         """从缓存文件加载行业分类映射"""
         try:
@@ -534,6 +689,11 @@ class AStockRealEstateDataCollector:
             import tushare as ts
             
             # 检查缓存
+        # DEBUG
+        if stock_code not in self.industry_cache:
+            print(f"DEBUG: {stock_code} not found in cache. Cache has {len(self.industry_cache)} items.")
+            if len(self.industry_cache) > 0:
+                print(f"DEBUG: Sample keys: {list(self.industry_cache.keys())[:5]}")
             if stock_code in self.industry_cache:
                 return self.industry_cache[stock_code]
             
@@ -573,6 +733,11 @@ class AStockRealEstateDataCollector:
         """从东方财富网获取申万行业分类（通过详情页解析）"""
         try:
             # 检查缓存
+        # DEBUG
+        if stock_code not in self.industry_cache:
+            print(f"DEBUG: {stock_code} not found in cache. Cache has {len(self.industry_cache)} items.")
+            if len(self.industry_cache) > 0:
+                print(f"DEBUG: Sample keys: {list(self.industry_cache.keys())[:5]}")
             if stock_code in self.industry_cache:
                 return self.industry_cache[stock_code]
             
@@ -582,7 +747,7 @@ class AStockRealEstateDataCollector:
             else:
                 code_with_market = '0.' + stock_code
             
-            url = f"https://push2.eastmoney.com/api/qt/stock/get"
+            url = f"https://push2delay.eastmoney.com/api/qt/stock/get"
             params = {
                 'secid': code_with_market,
                 'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
@@ -623,6 +788,11 @@ class AStockRealEstateDataCollector:
         """从新浪财经获取行业分类"""
         try:
             # 检查缓存
+        # DEBUG
+        if stock_code not in self.industry_cache:
+            print(f"DEBUG: {stock_code} not found in cache. Cache has {len(self.industry_cache)} items.")
+            if len(self.industry_cache) > 0:
+                print(f"DEBUG: Sample keys: {list(self.industry_cache.keys())[:5]}")
             if stock_code in self.industry_cache:
                 return self.industry_cache[stock_code]
             
@@ -1050,7 +1220,10 @@ class AStockRealEstateDataCollector:
             print("\n" + "="*60)
             print("🔍 第1步：获取完整股票列表")
             print("="*60)
+            # 预加载行业数据
+            self._preload_industry_cache()
             stock_list = self.get_stock_list()
+            print(f"DEBUG: Cache size AFTER preload: {len(self.industry_cache)}")
             if not stock_list:
                 logger.error("❌ 无法获取股票列表，程序退出")
                 return None
