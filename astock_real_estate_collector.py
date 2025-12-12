@@ -43,11 +43,13 @@ warnings.filterwarnings('ignore')
 
 # 导入配置
 from config import (
-    DATA_SOURCES, REQUEST_CONFIG, USER_AGENT_POOL, 
+    DATA_SOURCES, REQUEST_CONFIG, USER_AGENT_POOL,
     HEADERS_CONFIG, PROXY_CONFIG, OUTPUT_CONFIG,
     DATA_CLEANING_CONFIG, LOGGING_CONFIG, INDUSTRY_SOURCES,
-    INDUSTRY_CACHE_CONFIG
+    INDUSTRY_CACHE_CONFIG,
 )
+
+from industry_classification_fetcher import IndustryClassificationFetcher
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -80,6 +82,14 @@ class AStockRealEstateDataCollector:
         # 行业分类缓存
         self.industry_cache = {}
         self._load_industry_cache()
+
+        self.industry_fetcher = IndustryClassificationFetcher(
+            make_request=self._make_request,
+            cache=self.industry_cache,
+            sources_config=INDUSTRY_SOURCES,
+            logger=logger,
+        )
+        self.industry_fetcher.purge_invalid_cache_entries()
         
         logger.info("数据收集器初始化完成 - 反爬虫措施已启用")
         logger.info(f"User-Agent池大小: {len(USER_AGENT_POOL)}")
@@ -338,7 +348,7 @@ class AStockRealEstateDataCollector:
                         stock_info = {
                             'code': item.get('f12', ''),
                             'name': item.get('f14', ''),
-                            'industry': item.get('f15', '未知'),
+                            'industry': '',
                             'market': '上海' if item.get('f13') == '1' else '深圳'
                         }
                         if stock_info['code'] and stock_info['name']:
@@ -666,58 +676,9 @@ class AStockRealEstateDataCollector:
             return None
     
     def get_shenwan_industry(self, stock_code: str, stock_name: str) -> Dict:
-        """
-        获取申万行业分类
-        
-        优先级：tushare > 东方财富 > 新浪财经
-        
-        Returns:
-            包含shenwan_level1, shenwan_level2, shenwan_level3等字段的字典
-        """
+        """获取申万行业分类（多数据源 + 智能补全 + 缓存）。"""
         try:
-            # 优先使用缓存，避免重复网络请求
-            if stock_code in self.industry_cache:
-                return self.industry_cache[stock_code]
-
-            # 按优先级尝试从多个数据源获取（与config.py中的INDUSTRY_SOURCES键保持一致）
-            industry_sources = [
-                ('tushare', self._get_shenwan_industry_from_tushare),
-                ('eastmoney_detailed', self._get_shenwan_industry_from_eastmoney),
-                ('sina_industry', self._get_shenwan_industry_from_sina),
-            ]
-            industry_sources.sort(
-                key=lambda x: INDUSTRY_SOURCES.get(x[0], {}).get('weight', 0),
-                reverse=True,
-            )
-            
-            for source_name, get_func in industry_sources:
-                # 检查数据源是否启用
-                if not INDUSTRY_SOURCES.get(source_name, {}).get('enabled', False):
-                    continue
-                
-                try:
-                    if source_name == 'tushare':
-                        result = get_func(stock_code)
-                    else:
-                        result = get_func(stock_code, stock_name)
-                    
-                    if result:
-                        logger.debug(f"✅ 从{source_name}成功获取{stock_code}的行业分类")
-                        return result
-                except Exception as e:
-                    logger.debug(f"数据源{source_name}获取失败: {e}")
-                    continue
-            
-            # 如果所有数据源都失败，返回空字典
-            logger.warning(f"⚠️ 无法获取{stock_code}的申万行业分类，将使用通用值")
-            return {
-                'shenwan_level1': '未分类',
-                'shenwan_level2': '未分类',
-                'shenwan_level3': '未分类',
-                'industry': '未分类',
-                'source': 'unknown'
-            }
-            
+            return self.industry_fetcher.get_industry(stock_code, stock_name, "")
         except Exception as e:
             logger.error(f"获取{stock_code}行业分类过程出错: {e}")
             return {
@@ -725,7 +686,7 @@ class AStockRealEstateDataCollector:
                 'shenwan_level2': '错误',
                 'shenwan_level3': '错误',
                 'industry': '错误',
-                'source': 'error'
+                'source': 'error',
             }
     
     def search_real_estate_data(self, stock_code: str, stock_name: str) -> Dict:
@@ -968,6 +929,7 @@ class AStockRealEstateDataCollector:
                         '申万一级行业': item.get('shenwan_level1', ''),
                         '申万二级行业': item.get('shenwan_level2', ''),
                         '申万三级行业': item.get('shenwan_level3', ''),
+                        '申万行业来源': item.get('source', ''),
                         '通用行业分类': item.get('industry', ''),
                         '市场': item.get('market', '')
                     })
@@ -1073,9 +1035,21 @@ class AStockRealEstateDataCollector:
             
             print(f"✅ 股票列表准备完成，将处理{len(stock_list)}只股票\n")
             
-            # 2. 逐个获取股票数据
+            # 2. 批量获取并补全行业分类
             print("="*60)
-            print("🔍 第2步：获取房地产资产数据")
+            print("🏷️ 第2步：批量获取并补全申万行业分类")
+            print("="*60)
+            try:
+                industries = self.industry_fetcher.batch_get_industries(stock_list)
+                total = len(industries)
+                success = len([v for v in industries.values() if v.get('source') not in {'unknown', 'error'}])
+                print(f"✅ 行业分类获取完成：{success}/{total} 只股票获得有效分类")
+            except Exception as e:
+                logger.warning(f"批量获取行业分类失败，将在逐只处理时按需获取: {e}")
+
+            # 3. 逐个获取股票数据
+            print("="*60)
+            print("🔍 第3步：获取房地产资产数据")
             print("="*60)
             all_data = []
             
@@ -1090,7 +1064,8 @@ class AStockRealEstateDataCollector:
                 for i, stock in enumerate(stock_list):
                     try:
                         data = self.search_real_estate_data(stock['code'], stock['name'])
-                        data.update(stock)  # 合并基本信息
+                        stock_basic = {k: v for k, v in stock.items() if k != 'industry'}
+                        data.update(stock_basic)
                         all_data.append(data)
                         
                         pbar.set_postfix({
@@ -1129,16 +1104,16 @@ class AStockRealEstateDataCollector:
                 success_rate = (1 - self.failed_request_count / self.request_count) * 100
                 print(f"成功率: {success_rate:.1f}%")
             
-            # 3. 数据清洗和验证
+            # 4. 数据清洗和验证
             print("\n" + "="*60)
-            print("🧹 第3步：数据清洗和验证")
+            print("🧹 第4步：数据清洗和验证")
             print("="*60)
             cleaned_data = self.clean_and_validate_data(all_data)
             print(f"✅ 数据清洗完成，有效数据{len(cleaned_data)}条")
             
-            # 4. 导出到Excel
+            # 5. 导出到Excel
             print("\n" + "="*60)
-            print("📊 第4步：导出Excel文件")
+            print("📊 第5步：导出Excel文件")
             print("="*60)
             output_file = self.export_to_excel(cleaned_data)
             
@@ -1176,7 +1151,7 @@ def main():
     print("✨ 新特性:")
     print("   • 完整股票列表获取 (5000+只股票)")
     print("   • 反爬虫处理 (User-Agent轮换 + 随机延迟 + 指数退避)")
-    print("   • 申万行业分类获取和关联（tushare > 东方财富 > 新浪财经）")
+    print("   • 申万行业分类获取和关联（多源补全：东方财富行业板块/新浪申万/东方财富F10等）")
     print("   • 行业分类缓存机制（优化性能）")
     print("   • 进度条显示")
     print("   • 详细的请求统计")

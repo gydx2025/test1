@@ -27,24 +27,64 @@ DATA_SOURCES = {
 }
 
 # 行业分类数据源配置（申万行业分类）
+# 说明：不同平台对“行业”口径不同，这里统一输出到 shenwan_level1/2/3 字段，
+# 并记录 source 便于追溯。
 INDUSTRY_SOURCES = {
-    'tushare': {
-        'enabled': True,  # tushare - 标准化的申万行业分类
+    'eastmoney_industry_board': {
+        'enabled': True,
+        'base_url': 'https://push2.eastmoney.com',
+        'timeout': 20,
+        'weight': 5,
+        'min_batch_size': 300,
+    },
+    'sina_shenwan': {
+        'enabled': True,
+        'base_url': 'https://vip.stock.finance.sina.com.cn',
+        'timeout': 20,
+        'weight': 4,
+    },
+    'eastmoney_f10': {
+        'enabled': True,
+        'base_url': 'https://emweb.securities.eastmoney.com',
+        'timeout': 20,
+        'weight': 3,
+    },
+    'eastmoney_quote': {
+        'enabled': True,
+        'base_url': 'https://push2.eastmoney.com',
+        'timeout': 20,
+        'weight': 2,
+    },
+    'tencent_quote': {
+        'enabled': True,
+        'base_url': 'https://qt.gtimg.cn',
         'timeout': 15,
-        'weight': 3  # 优先级权重，数字越大优先级越高
+        'weight': 1,
+    },
+    'netease_f10': {
+        'enabled': True,
+        'base_url': 'https://quotes.money.163.com',
+        'timeout': 15,
+        'weight': 0,
+    },
+    # 旧版数据源（保留配置项以兼容历史文档/代码路径）
+    'tushare': {
+        'enabled': False,
+        'timeout': 15,
+        'weight': 0,
     },
     'eastmoney_detailed': {
-        'enabled': True,  # 东方财富详细行业信息
+        'enabled': False,
         'base_url': 'https://quote.eastmoney.com',
         'timeout': 20,
-        'weight': 2
+        'weight': 0,
     },
     'sina_industry': {
-        'enabled': True,  # 新浪财经行业信息
+        'enabled': False,
         'base_url': 'https://money.finance.sina.com.cn',
         'timeout': 15,
-        'weight': 1
-    }
+        'weight': 0,
+    },
 }
 
 # 请求配置
