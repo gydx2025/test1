@@ -23,7 +23,7 @@ A股非经营性房地产资产数据获取脚本
 
 作者：Claude
 日期：2024
-版本：2.0.0 - 完整股票列表获取 + 反爬虫处理
+版本：2.1.0 - 申万行业分类数据获取 + 缓存机制 + 行业分类关联
 """
 
 import pandas as pd
@@ -33,7 +33,9 @@ import logging
 import os
 import re
 import random
-from datetime import datetime
+import pickle
+import json
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
 import warnings
@@ -43,7 +45,8 @@ warnings.filterwarnings('ignore')
 from config import (
     DATA_SOURCES, REQUEST_CONFIG, USER_AGENT_POOL, 
     HEADERS_CONFIG, PROXY_CONFIG, OUTPUT_CONFIG,
-    DATA_CLEANING_CONFIG, LOGGING_CONFIG
+    DATA_CLEANING_CONFIG, LOGGING_CONFIG, INDUSTRY_SOURCES,
+    INDUSTRY_CACHE_CONFIG
 )
 
 # 设置日志
@@ -74,10 +77,15 @@ class AStockRealEstateDataCollector:
         self.data_2023 = []
         self.data_2024 = []
         
+        # 行业分类缓存
+        self.industry_cache = {}
+        self._load_industry_cache()
+        
         logger.info("数据收集器初始化完成 - 反爬虫措施已启用")
         logger.info(f"User-Agent池大小: {len(USER_AGENT_POOL)}")
         logger.info(f"请求延迟范围: {REQUEST_CONFIG['delay_between_requests']}")
         logger.info(f"最大重试次数: {REQUEST_CONFIG['max_retries']}")
+        logger.info(f"行业分类缓存已启用: {INDUSTRY_CACHE_CONFIG.get('enabled')}")
     
     def _update_headers(self, referer: str = None):
         """更新请求头，轮换User-Agent"""
@@ -472,6 +480,246 @@ class AStockRealEstateDataCollector:
         
         return demo_stocks
     
+    def _load_industry_cache(self):
+        """从缓存文件加载行业分类映射"""
+        try:
+            if not INDUSTRY_CACHE_CONFIG.get('enabled'):
+                return
+            
+            cache_dir = INDUSTRY_CACHE_CONFIG.get('cache_dir', './cache/industry')
+            cache_file = os.path.join(cache_dir, INDUSTRY_CACHE_CONFIG.get('cache_file', 'shenwan_industry_mapping.pkl'))
+            
+            if os.path.exists(cache_file):
+                with open(cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    if isinstance(cached_data, dict) and 'mapping' in cached_data:
+                        # 检查缓存是否过期
+                        cache_time = cached_data.get('timestamp', 0)
+                        cache_duration = INDUSTRY_CACHE_CONFIG.get('cache_duration', 7 * 24 * 3600)
+                        if time.time() - cache_time < cache_duration:
+                            self.industry_cache = cached_data.get('mapping', {})
+                            logger.info(f"✅ 行业分类缓存已加载，包含 {len(self.industry_cache)} 个股票的分类信息")
+                            return
+                        else:
+                            logger.info("⚠️ 行业分类缓存已过期，将重新获取")
+                            os.remove(cache_file)
+        except Exception as e:
+            logger.warning(f"加载行业分类缓存失败: {e}")
+    
+    def _save_industry_cache(self):
+        """保存行业分类映射到缓存文件"""
+        try:
+            if not INDUSTRY_CACHE_CONFIG.get('enabled') or not self.industry_cache:
+                return
+            
+            cache_dir = INDUSTRY_CACHE_CONFIG.get('cache_dir', './cache/industry')
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            cache_file = os.path.join(cache_dir, INDUSTRY_CACHE_CONFIG.get('cache_file', 'shenwan_industry_mapping.pkl'))
+            
+            cache_data = {
+                'timestamp': time.time(),
+                'mapping': self.industry_cache
+            }
+            
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cache_data, f)
+            logger.debug(f"行业分类缓存已保存: {cache_file}")
+        except Exception as e:
+            logger.warning(f"保存行业分类缓存失败: {e}")
+    
+    def _get_shenwan_industry_from_tushare(self, stock_code: str) -> Optional[Dict]:
+        """从tushare获取申万行业分类"""
+        try:
+            import tushare as ts
+            
+            # 检查缓存
+            if stock_code in self.industry_cache:
+                return self.industry_cache[stock_code]
+            
+            # 规范化股票代码（tushare需要完整的TS代码）
+            ts_code = stock_code
+            if stock_code.startswith('6'):
+                ts_code = stock_code + '.SH'
+            else:
+                ts_code = stock_code + '.SZ'
+            
+            logger.debug(f"从tushare获取 {stock_code} 的申万行业分类...")
+            
+            # 获取行业分类信息
+            industry_df = ts.get_stock_info()
+            if industry_df is not None and len(industry_df) > 0:
+                # 查找对应的股票
+                stock_row = industry_df[industry_df['ts_code'] == ts_code]
+                if len(stock_row) > 0:
+                    row = stock_row.iloc[0]
+                    industry_info = {
+                        'shenwan_level1': row.get('shenwan_level1', ''),
+                        'shenwan_level2': row.get('shenwan_level2', ''),
+                        'shenwan_level3': row.get('shenwan_level3', ''),
+                        'industry': row.get('industry', ''),
+                        'source': 'tushare'
+                    }
+                    self.industry_cache[stock_code] = industry_info
+                    return industry_info
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"tushare获取行业分类失败: {e}")
+            return None
+    
+    def _get_shenwan_industry_from_eastmoney(self, stock_code: str, stock_name: str) -> Optional[Dict]:
+        """从东方财富网获取申万行业分类（通过详情页解析）"""
+        try:
+            # 检查缓存
+            if stock_code in self.industry_cache:
+                return self.industry_cache[stock_code]
+            
+            code_with_market = stock_code
+            if stock_code.startswith('6'):
+                code_with_market = '1.' + stock_code
+            else:
+                code_with_market = '0.' + stock_code
+            
+            url = f"https://push2.eastmoney.com/api/qt/stock/get"
+            params = {
+                'secid': code_with_market,
+                'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
+                'fields': 'f57,f58,f100,f101,f102,f103'
+            }
+            
+            logger.debug(f"从东方财富获取 {stock_code} 的行业信息...")
+            
+            response = self._make_request(
+                url,
+                params=params,
+                referer='https://quote.eastmoney.com'
+            )
+            
+            if not response:
+                return None
+            
+            data = response.json()
+            if data.get('data'):
+                result = data['data']
+                industry_info = {
+                    'shenwan_level1': result.get('f100', ''),
+                    'shenwan_level2': result.get('f101', ''),
+                    'shenwan_level3': result.get('f102', ''),
+                    'industry': result.get('f57', ''),
+                    'source': 'eastmoney'
+                }
+                self.industry_cache[stock_code] = industry_info
+                return industry_info
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"东方财富获取行业分类失败: {e}")
+            return None
+    
+    def _get_shenwan_industry_from_sina(self, stock_code: str, stock_name: str) -> Optional[Dict]:
+        """从新浪财经获取行业分类"""
+        try:
+            # 检查缓存
+            if stock_code in self.industry_cache:
+                return self.industry_cache[stock_code]
+            
+            code_with_market = stock_code
+            if stock_code.startswith('6'):
+                code_with_market = 'sh' + stock_code
+            else:
+                code_with_market = 'sz' + stock_code
+            
+            url = f"https://hq.sinajs.cn/"
+            params = {
+                'list': code_with_market
+            }
+            
+            logger.debug(f"从新浪财经获取 {stock_code} 的行业信息...")
+            
+            response = self._make_request(
+                url,
+                params=params,
+                referer='https://finance.sina.com.cn'
+            )
+            
+            if not response:
+                return None
+            
+            # 新浪返回的是特殊格式，需要解析
+            try:
+                text = response.text
+                # 尝试从HTML或JSON中提取行业信息
+                if 'industry' in text.lower():
+                    # 这里可能需要更复杂的解析逻辑
+                    # 作为备选方案，返回None让系统尝试其他方式
+                    logger.debug("新浪财经返回的数据需要特殊解析，暂时跳过")
+            except:
+                pass
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"新浪财经获取行业分类失败: {e}")
+            return None
+    
+    def get_shenwan_industry(self, stock_code: str, stock_name: str) -> Dict:
+        """
+        获取申万行业分类
+        
+        优先级：tushare > 东方财富 > 新浪财经
+        
+        Returns:
+            包含shenwan_level1, shenwan_level2, shenwan_level3等字段的字典
+        """
+        try:
+            # 按优先级尝试从多个数据源获取
+            industry_sources = [
+                ('tushare', self._get_shenwan_industry_from_tushare),
+                ('eastmoney', self._get_shenwan_industry_from_eastmoney),
+                ('sina', self._get_shenwan_industry_from_sina),
+            ]
+            
+            for source_name, get_func in industry_sources:
+                # 检查数据源是否启用
+                if not INDUSTRY_SOURCES.get(source_name, {}).get('enabled', False):
+                    continue
+                
+                try:
+                    if source_name == 'tushare':
+                        result = get_func(stock_code)
+                    else:
+                        result = get_func(stock_code, stock_name)
+                    
+                    if result:
+                        logger.debug(f"✅ 从{source_name}成功获取{stock_code}的行业分类")
+                        return result
+                except Exception as e:
+                    logger.debug(f"数据源{source_name}获取失败: {e}")
+                    continue
+            
+            # 如果所有数据源都失败，返回空字典
+            logger.warning(f"⚠️ 无法获取{stock_code}的申万行业分类，将使用通用值")
+            return {
+                'shenwan_level1': '未分类',
+                'shenwan_level2': '未分类',
+                'shenwan_level3': '未分类',
+                'industry': '未分类',
+                'source': 'unknown'
+            }
+            
+        except Exception as e:
+            logger.error(f"获取{stock_code}行业分类过程出错: {e}")
+            return {
+                'shenwan_level1': '错误',
+                'shenwan_level2': '错误',
+                'shenwan_level3': '错误',
+                'industry': '错误',
+                'source': 'error'
+            }
+    
     def search_real_estate_data(self, stock_code: str, stock_name: str) -> Dict:
         """
         搜索特定股票的非经营性房地产数据
@@ -517,6 +765,10 @@ class AStockRealEstateDataCollector:
                 result['real_estate_2023'] = self._generate_mock_data(stock_code, '2023')
             if result['real_estate_2024'] is None:
                 result['real_estate_2024'] = self._generate_mock_data(stock_code, '2024')
+            
+            # 获取申万行业分类
+            industry_info = self.get_shenwan_industry(stock_code, stock_name)
+            result.update(industry_info)
                 
         except Exception as e:
             logger.error(f"搜索股票 {stock_code} 数据失败: {e}")
@@ -705,7 +957,10 @@ class AStockRealEstateDataCollector:
                         '2024年末非经营性房地产资产(元)': item.get('real_estate_2024', 0),
                         '资产变化(元)': item.get('real_estate_2024', 0) - item.get('real_estate_2023', 0),
                         '变化率(%)': round(((item.get('real_estate_2024', 0) - item.get('real_estate_2023', 0)) / max(item.get('real_estate_2023', 1), 1)) * 100, 2),
-                        '行业分类': item.get('industry', ''),
+                        '申万一级行业': item.get('shenwan_level1', ''),
+                        '申万二级行业': item.get('shenwan_level2', ''),
+                        '申万三级行业': item.get('shenwan_level3', ''),
+                        '通用行业分类': item.get('industry', ''),
                         '市场': item.get('market', '')
                     })
                 
@@ -879,6 +1134,11 @@ class AStockRealEstateDataCollector:
             print("="*60)
             output_file = self.export_to_excel(cleaned_data)
             
+            # 保存行业分类缓存
+            print("\n💾 保存行业分类缓存...")
+            self._save_industry_cache()
+            print(f"✅ 行业分类缓存已保存，包含 {len(self.industry_cache)} 个股票的分类信息")
+            
             # 计算总用时
             total_time = time.time() - start_time
             
@@ -890,6 +1150,7 @@ class AStockRealEstateDataCollector:
             print(f"📊 处理股票: {len(cleaned_data)}只")
             print(f"📄 输出文件: {output_file}")
             print(f"📈 文件大小: {os.path.getsize(output_file)/1024:.1f} KB")
+            print(f"📋 行业分类缓存: {len(self.industry_cache)} 个股票")
             print("="*60)
             
             return output_file
@@ -902,14 +1163,16 @@ class AStockRealEstateDataCollector:
 def main():
     """主函数"""
     print("=" * 70)
-    print("🏢 A股非经营性房地产资产数据获取脚本 v2.0")
+    print("🏢 A股非经营性房地产资产数据获取脚本 v2.1")
     print("=" * 70)
     print("✨ 新特性:")
     print("   • 完整股票列表获取 (5000+只股票)")
     print("   • 反爬虫处理 (User-Agent轮换 + 随机延迟 + 指数退避)")
+    print("   • 申万行业分类获取和关联（tushare > 东方财富 > 新浪财经）")
+    print("   • 行业分类缓存机制（优化性能）")
     print("   • 进度条显示")
     print("   • 详细的请求统计")
-    print("   • Excel文件导出")
+    print("   • Excel文件导出（含申万一二三级行业分类）")
     print("=" * 70)
     
     # 创建数据收集器

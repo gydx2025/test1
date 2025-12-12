@@ -26,6 +26,27 @@ DATA_SOURCES = {
     }
 }
 
+# 行业分类数据源配置（申万行业分类）
+INDUSTRY_SOURCES = {
+    'tushare': {
+        'enabled': True,  # tushare - 标准化的申万行业分类
+        'timeout': 15,
+        'weight': 3  # 优先级权重，数字越大优先级越高
+    },
+    'eastmoney_detailed': {
+        'enabled': True,  # 东方财富详细行业信息
+        'base_url': 'https://quote.eastmoney.com',
+        'timeout': 20,
+        'weight': 2
+    },
+    'sina_industry': {
+        'enabled': True,  # 新浪财经行业信息
+        'base_url': 'https://money.finance.sina.com.cn',
+        'timeout': 15,
+        'weight': 1
+    }
+}
+
 # 请求配置
 REQUEST_CONFIG = {
     'delay_between_requests': (0.5, 2.0),  # 请求间隔范围(秒) - 随机延迟
@@ -116,10 +137,18 @@ LOGGING_CONFIG = {
 
 # 缓存配置
 CACHE_CONFIG = {
-    'enabled': False,  # 是否启用缓存
+    'enabled': True,  # 是否启用缓存
     'cache_dir': './cache',
     'cache_duration': 3600,  # 缓存时间(秒)
     'clean_on_start': False  # 启动时是否清理缓存
+}
+
+# 行业分类缓存配置
+INDUSTRY_CACHE_CONFIG = {
+    'enabled': True,  # 是否启用行业分类缓存
+    'cache_dir': './cache/industry',
+    'cache_file': 'shenwan_industry_mapping.pkl',  # 行业分类映射缓存文件
+    'cache_duration': 7 * 24 * 3600,  # 缓存时间(秒，默认7天)
 }
 
 # 测试配置
