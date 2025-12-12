@@ -675,12 +675,20 @@ class AStockRealEstateDataCollector:
             包含shenwan_level1, shenwan_level2, shenwan_level3等字段的字典
         """
         try:
-            # 按优先级尝试从多个数据源获取
+            # 优先使用缓存，避免重复网络请求
+            if stock_code in self.industry_cache:
+                return self.industry_cache[stock_code]
+
+            # 按优先级尝试从多个数据源获取（与config.py中的INDUSTRY_SOURCES键保持一致）
             industry_sources = [
                 ('tushare', self._get_shenwan_industry_from_tushare),
-                ('eastmoney', self._get_shenwan_industry_from_eastmoney),
-                ('sina', self._get_shenwan_industry_from_sina),
+                ('eastmoney_detailed', self._get_shenwan_industry_from_eastmoney),
+                ('sina_industry', self._get_shenwan_industry_from_sina),
             ]
+            industry_sources.sort(
+                key=lambda x: INDUSTRY_SOURCES.get(x[0], {}).get('weight', 0),
+                reverse=True,
+            )
             
             for source_name, get_func in industry_sources:
                 # 检查数据源是否启用
