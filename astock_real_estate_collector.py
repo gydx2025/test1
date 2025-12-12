@@ -258,12 +258,8 @@ class AStockRealEstateDataCollector:
             if stock_list:
                 logger.info(f"✅ 股票列表获取完成！总计获取 {len(stock_list)} 只股票")
                 
-                # 显示股票代码范围
-                codes = [stock['code'] for stock in stock_list if stock['code']]
-                if codes:
-                    min_code = min(codes)
-                    max_code = max(codes)
-                    logger.info(f"📈 股票代码范围: {min_code} - {max_code}")
+                # 验证和统计股票列表
+                self._validate_and_report_stock_list(stock_list)
             else:
                 logger.warning("⚠️ 所有数据源都无法获取股票列表，将使用模拟数据进行演示")
                 stock_list = self._generate_demo_stock_list()
@@ -275,6 +271,47 @@ class AStockRealEstateDataCollector:
             # 返回演示数据
             return self._generate_demo_stock_list()
     
+    def _validate_and_report_stock_list(self, stocks: List[Dict]):
+        """验证并统计股票列表的完整性"""
+        if not stocks:
+            logger.warning("⚠️ 股票列表为空")
+            return
+        
+        # 提取代码
+        codes = [stock['code'] for stock in stocks if stock['code']]
+        if not codes:
+            logger.warning("⚠️ 没有有效的股票代码")
+            return
+        
+        # 统计各类型代码
+        code_6 = sum(1 for c in codes if c.startswith('6'))
+        code_0 = sum(1 for c in codes if c.startswith('0'))
+        code_3 = sum(1 for c in codes if c.startswith('3'))
+        code_8 = sum(1 for c in codes if c.startswith('8'))
+        code_4 = sum(1 for c in codes if c.startswith('4'))
+        
+        # 输出统计信息
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📊 股票列表统计信息:")
+        logger.info(f"   总数量: {len(stocks)} 只")
+        logger.info(f"   6开头（沪深主板）: {code_6} 只")
+        logger.info(f"   0开头（深圳主板）: {code_0} 只")
+        logger.info(f"   3开头（创业板）: {code_3} 只")
+        logger.info(f"   8开头（北交所）: {code_8} 只")
+        logger.info(f"   4开头（北交所）: {code_4} 只")
+        logger.info(f"{'='*60}")
+        
+        # 验证数量
+        if len(stocks) >= 5000:
+            logger.info(f"✅ 股票数量足够（>= 5000）")
+        else:
+            logger.warning(f"⚠️ 警告: 股票数量 {len(stocks)} 少于目标 5000")
+        
+        # 显示股票代码范围
+        min_code = min(codes)
+        max_code = max(codes)
+        logger.info(f"📈 股票代码范围: {min_code} - {max_code}")
+    
     def _get_stock_list_from_eastmoney(self) -> List[Dict]:
         """从东方财富网获取股票列表（带反爬虫处理和完整分页）"""
         try:
@@ -283,6 +320,7 @@ class AStockRealEstateDataCollector:
             stock_list = []
             total_stocks = 0
             current_page = 1
+            consecutive_empty_pages = 0
             
             # API参数配置
             params = {
@@ -317,16 +355,28 @@ class AStockRealEstateDataCollector:
                     )
                     
                     if not response:
-                        logger.error(f"第{current_page}页请求失败")
-                        break
+                        logger.warning(f"第{current_page}页请求失败，尝试继续...")
+                        consecutive_empty_pages += 1
+                        if consecutive_empty_pages >= 3:
+                            logger.error(f"连续{consecutive_empty_pages}页请求失败，停止获取")
+                            break
+                        current_page += 1
+                        continue
                     
                     # 尝试解析JSON
                     try:
                         data = response.json()
                     except Exception as json_error:
-                        logger.error(f"JSON解析失败: {json_error}")
-                        logger.debug(f"响应内容: {response.text[:200]}")
-                        break
+                        logger.warning(f"第{current_page}页JSON解析失败，尝试继续: {json_error}")
+                        consecutive_empty_pages += 1
+                        if consecutive_empty_pages >= 3:
+                            logger.error(f"连续{consecutive_empty_pages}页解析失败，停止获取")
+                            break
+                        current_page += 1
+                        continue
+                    
+                    # 重置连续失败计数
+                    consecutive_empty_pages = 0
                     
                     # 检查是否有数据
                     if not data.get('data') or not data['data'].get('diff'):
@@ -364,9 +414,9 @@ class AStockRealEstateDataCollector:
                         logger.info("✅ 已获取所有股票数据")
                         break
                     
-                    # 防止无限循环
-                    if current_page > 60:  # 最多60页 = 6000只股票
-                        logger.warning("⚠️ 达到页数限制(60页)，停止获取")
+                    # 防止无限循环（支持最多100页 = 10000只股票，足以覆盖全部5000+）
+                    if current_page > 100:
+                        logger.warning("⚠️ 达到页数限制(100页)，停止获取")
                         break
                     
                     current_page += 1
@@ -377,7 +427,11 @@ class AStockRealEstateDataCollector:
                     
                 except Exception as e:
                     logger.error(f"第{current_page}页处理异常: {e}")
-                    break
+                    consecutive_empty_pages += 1
+                    if consecutive_empty_pages >= 3:
+                        logger.error(f"连续异常{consecutive_empty_pages}次，停止获取")
+                        break
+                    current_page += 1
             
             if pbar:
                 pbar.close()
@@ -396,19 +450,19 @@ class AStockRealEstateDataCollector:
             return []
     
     def _get_stock_list_backup(self) -> List[Dict]:
-        """备用股票列表获取方法 - 使用tushare"""
+        """备用股票列表获取方法 - 使用多个数据源"""
         try:
-            logger.info("🔄 尝试备用数据源(tushare)...")
+            all_stocks = {}
             
+            # 方案1: 尝试使用tushare
+            logger.info("🔄 尝试备用数据源1: tushare...")
             try:
                 import tushare as ts
                 
-                # 获取股票基本信息
                 logger.info("正在从tushare获取股票列表...")
                 stock_basic = ts.get_stock_basics()
                 
                 if stock_basic is not None and len(stock_basic) > 0:
-                    stock_list = []
                     for code, row in stock_basic.iterrows():
                         stock_info = {
                             'code': code,
@@ -416,52 +470,87 @@ class AStockRealEstateDataCollector:
                             'industry': row.get('industry', '未知'),
                             'market': '上海' if code.startswith('6') else '深圳'
                         }
-                        stock_list.append(stock_info)
+                        if code not in all_stocks:
+                            all_stocks[code] = stock_info
                     
-                    logger.info(f"✅ 从tushare获取到{len(stock_list)}只股票")
-                    return stock_list
+                    logger.info(f"✅ 从tushare获取到{len(stock_basic)}只股票")
+                    if len(all_stocks) >= 5000:
+                        return list(all_stocks.values())
                 
             except ImportError:
                 logger.warning("tushare模块未安装或无法导入")
             except Exception as e:
                 logger.warning(f"tushare获取失败: {e}")
             
-            # 尝试使用新浪财经的股票列表API
-            logger.info("🔄 尝试新浪财经股票列表...")
+            # 方案2: 尝试使用新浪财经的股票列表API（分页）
+            logger.info("🔄 尝试备用数据源2: 新浪财经（分页获取）...")
             try:
                 url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-                params = {
-                    'page': 1,
-                    'num': 5000,
-                    'sort': 'symbol',
-                    'asc': 1,
-                    'node': 'hs_a',
-                    'symbol': '',
-                    '_s_r_a': 'page'
-                }
                 
-                response = self._make_request(url, params=params)
-                if response:
-                    data = response.json()
-                    if data and isinstance(data, list):
-                        stock_list = []
-                        for item in data:
-                            code = item.get('code', '')
-                            if code:
-                                stock_info = {
-                                    'code': code,
-                                    'name': item.get('name', ''),
-                                    'industry': item.get('industry', '未知'),
-                                    'market': '上海' if code.startswith('6') else '深圳'
-                                }
-                                stock_list.append(stock_info)
+                # 分页获取所有数据
+                page = 1
+                while True:
+                    params = {
+                        'page': page,
+                        'num': 500,  # 每页500条
+                        'sort': 'symbol',
+                        'asc': 1,
+                        'node': 'hs_a',
+                        'symbol': '',
+                        '_s_r_a': 'page'
+                    }
+                    
+                    response = self._make_request(url, params=params)
+                    if not response:
+                        logger.warning(f"第{page}页请求失败")
+                        break
+                    
+                    try:
+                        data = response.json()
+                    except:
+                        logger.warning(f"第{page}页JSON解析失败")
+                        break
+                    
+                    if not data or not isinstance(data, list):
+                        logger.info(f"第{page}页无数据，停止分页获取")
+                        break
+                    
+                    page_count = 0
+                    for item in data:
+                        code = item.get('code', '')
+                        if code and code not in all_stocks:
+                            stock_info = {
+                                'code': code,
+                                'name': item.get('name', ''),
+                                'industry': item.get('industry', '未知'),
+                                'market': '上海' if code.startswith('6') else '深圳'
+                            }
+                            all_stocks[code] = stock_info
+                            page_count += 1
+                    
+                    logger.info(f"✅ 第{page}页: 获取{page_count}只股票，总计{len(all_stocks)}只")
+                    
+                    if len(data) < 500:
+                        logger.info("已获取所有数据（最后一页数据不足500条）")
+                        break
+                    
+                    if page > 20:  # 限制最多20页（10000条）
+                        logger.warning("达到分页限制")
+                        break
+                    
+                    page += 1
+                    
+                if len(all_stocks) >= 5000:
+                    logger.info(f"✅ 从新浪财经获取到{len(all_stocks)}只股票")
+                    return list(all_stocks.values())
                         
-                        if stock_list:
-                            logger.info(f"✅ 从新浪财经获取到{len(stock_list)}只股票")
-                            return stock_list
-                            
             except Exception as e:
                 logger.warning(f"新浪财经获取失败: {e}")
+            
+            # 如果获取了一些股票，返回
+            if all_stocks:
+                logger.info(f"✅ 从备用数据源获取到{len(all_stocks)}只股票")
+                return list(all_stocks.values())
             
             # 所有备用方案都失败
             logger.warning("所有备用数据源都无法获取股票列表")
