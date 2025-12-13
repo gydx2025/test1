@@ -50,6 +50,7 @@ from config import (
 )
 
 from industry_classification_fetcher import IndustryClassificationFetcher
+from industry_classification_complete_getter import IndustryClassificationCompleteGetter
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1664,17 +1665,34 @@ class AStockRealEstateDataCollector:
             
             print(f"✅ 股票列表准备完成，将处理{len(stock_list)}只股票\n")
             
-            # 2. 批量获取并补全行业分类
+            # 2. 多源循环补全行业分类
             print("="*60)
-            print("🏷️ 第2步：批量获取并补全申万行业分类")
+            print("🏷️ 第2步：多源循环补全申万行业分类")
             print("="*60)
             try:
+                # 使用新的多源循环补全获取器
+                complete_getter = IndustryClassificationCompleteGetter(logger=logger)
+                industries = complete_getter.get_complete_classification(stock_list, show_progress=True)
+                
+                # 将结果转换为旧格式以兼容现有代码
+                industries_dict = {code: data for code, data in industries.items()}
+                total = len(industries_dict)
+                success = len([v for v in industries_dict.values() if v.get('source') not in {'unknown', 'error'}])
+                
+                # 更新缓存
+                self.industry_cache.update(industries_dict)
+                self._save_industry_cache()
+                
+                print(f"✅ 多源循环补全完成：{success}/{total} 只股票获得有效分类")
+                print(f"📊 覆盖率: {success/total*100:.1f}%")
+                
+            except Exception as e:
+                logger.warning(f"多源循环补全行业分类失败，使用备用方案: {e}")
+                # 备用方案：使用旧的获取器
                 industries = self.industry_fetcher.batch_get_industries(stock_list)
                 total = len(industries)
                 success = len([v for v in industries.values() if v.get('source') not in {'unknown', 'error'}])
-                print(f"✅ 行业分类获取完成：{success}/{total} 只股票获得有效分类")
-            except Exception as e:
-                logger.warning(f"批量获取行业分类失败，将在逐只处理时按需获取: {e}")
+                print(f"✅ 备用方案完成：{success}/{total} 只股票获得有效分类")
 
             # 3. 逐个获取股票数据
             print("="*60)
