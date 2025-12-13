@@ -191,6 +191,94 @@ INDUSTRY_CACHE_CONFIG = {
     'cache_duration': 7 * 24 * 3600,  # 缓存时间(秒，默认7天)
 }
 
+# ═══════════════════════════════════════════════════════
+# 行业分类获取超时配置
+# ═══════════════════════════════════════════════════════
+REQUEST_TIMEOUT = 20          # 单个HTTP请求超时 (秒)
+API_SOURCE_TIMEOUT = 300      # 单个源的总超时 (秒，5分钟)
+MAX_RETRIES = 3               # 单个源内的最大重试次数
+BATCH_SIZE = 100              # 每批处理的股票数
+PROGRESS_INTERVAL = 100       # 每处理100只股票显示一次进度
+
+# 循环获取配置
+MAX_RETRY_ROUNDS = 8          # 最多尝试8个源（等于源的个数）
+RETRY_WAIT_TIME = 1           # 源之间的等待时间 (秒)
+
+# 完整行业分类数据源配置（8个分层数据源）
+COMPLETE_INDUSTRY_SOURCES = {
+    # 第一级 - 高速源 (响应快，覆盖完整)
+    'eastmoney_quote': {
+        'enabled': True,
+        'name': '东方财富行情',
+        'priority': 1,
+        'timeout': 15,
+        'retry_count': 2,
+        'description': '东方财富实时行情接口，快速可靠'
+    },
+    'eastmoney_f10': {
+        'enabled': True,
+        'name': '东方财富F10',
+        'priority': 2,
+        'timeout': 20,
+        'retry_count': 3,
+        'description': '东方财富F10页面，行业分类权威'
+    },
+    
+    # 第二级 - 标准源 (官方或权威，覆盖全)
+    'sina_shenwan': {
+        'enabled': True,
+        'name': '新浪财经',
+        'priority': 3,
+        'timeout': 20,
+        'retry_count': 3,
+        'description': '新浪财经申万行业板块，备用爬取源'
+    },
+    'akshare': {
+        'enabled': True,
+        'name': 'AkShare',
+        'priority': 4,
+        'timeout': 30,
+        'retry_count': 2,
+        'description': 'AkShare股票信息接口，快速可靠'
+    },
+    
+    # 第三级 - 扩展源 (补全覆盖)
+    'tencent_quote': {
+        'enabled': True,
+        'name': '腾讯财经',
+        'priority': 5,
+        'timeout': 15,
+        'retry_count': 2,
+        'description': '腾讯财经行业分类字段'
+    },
+    'netease_f10': {
+        'enabled': True,
+        'name': '网易财经',
+        'priority': 6,
+        'timeout': 15,
+        'retry_count': 2,
+        'description': '网易财经行业分类字段'
+    },
+    
+    # 第四级 - 深度源 (最后补全)
+    'cninfo': {
+        'enabled': True,
+        'name': '巨潮资讯',
+        'priority': 7,
+        'timeout': 30,
+        'retry_count': 1,
+        'description': '巨潮资讯上市公司分类'
+    },
+    'cache_mapping': {
+        'enabled': True,
+        'name': '缓存库映射',
+        'priority': 8,
+        'timeout': 5,
+        'retry_count': 1,
+        'description': '已知历史映射和手动映射'
+    }
+}
+
 # 测试配置
 TEST_CONFIG = {
     'max_stocks_for_test': 10,  # 测试时最大股票数量
