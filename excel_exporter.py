@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+标准化的Excel导出系统
+
+提供规范的Excel文件生成、格式化、多表管理等功能
+"""
+
+import logging
+import os
+from typing import List, Dict, Optional
+from datetime import datetime
+import xlsxwriter
+
+logger = logging.getLogger(__name__)
+
+
+class ExcelExporter:
+    """标准化的Excel导出系统"""
+    
+    def __init__(self):
+        """初始化Excel导出器"""
+        self.workbook = None
+        self.worksheets = {}
+        self.formats = {}
+        self._init_formats()
+    
+    def _init_formats(self):
+        """初始化格式"""
+        if not self.workbook:
+            return
+        
+        # 标题格式
+        self.formats['title'] = self.workbook.add_format({
+            'font_size': 16,
+            'bold': True,
+            'align': 'center',
+            'valign': 'vcenter',
+            'bg_color': '#4472C4',
+            'font_color': '#FFFFFF'
+        })
+        
+        # 表头格式
+        self.formats['header'] = self.workbook.add_format({
+            'bold': True,
+            'align': 'center',
+            'valign': 'vcenter',
+            'bg_color': '#D9E1F2',
+            'border': 1,
+            'border_color': '#000000'
+        })
+        
+        # 数据格式
+        self.formats['data'] = self.workbook.add_format({
+            'align': 'left',
+            'valign': 'vcenter',
+            'border': 1,
+            'border_color': '#CCCCCC'
+        })
+        
+        # 数字格式
+        self.formats['number'] = self.workbook.add_format({
+            'align': 'right',
+            'valign': 'vcenter',
+            'border': 1,
+            'border_color': '#CCCCCC',
+            'num_format': '#,##0.00'
+        })
+        
+        # 百分比格式
+        self.formats['percent'] = self.workbook.add_format({
+            'align': 'center',
+            'valign': 'vcenter',
+            'border': 1,
+            'border_color': '#CCCCCC',
+            'num_format': '0.00%'
+        })
+        
+        # 日期格式
+        self.formats['date'] = self.workbook.add_format({
+            'align': 'center',
+            'valign': 'vcenter',
+            'border': 1,
+            'border_color': '#CCCCCC',
+            'num_format': 'yyyy-mm-dd'
+        })
+        
+        # 缺失数据格式（红色背景）
+        self.formats['missing'] = self.workbook.add_format({
+            'align': 'center',
+            'valign': 'vcenter',
+            'border': 1,
+            'border_color': '#CCCCCC',
+            'bg_color': '#FFCCCC'
+        })
+        
+        # 统计格式
+        self.formats['stat'] = self.workbook.add_format({
+            'bold': True,
+            'align': 'center',
+            'valign': 'vcenter',
+            'bg_color': '#FFF2CC',
+            'border': 1,
+            'border_color': '#000000'
+        })
+    
+    def create_workbook(self, filename: str):
+        """
+        创建新的工作簿
+        
+        Args:
+            filename: 文件名
+        """
+        self.workbook = xlsxwriter.Workbook(filename)
+        self._init_formats()
+        logger.info(f"Excel工作簿已创建: {filename}")
+    
+    def add_basic_info_sheet(self, stocks: List[Dict]):
+        """
+        添加基础信息表
+        
+        包含列：代码、名称、市场、上市日期、数据源
+        
+        Args:
+            stocks: 股票列表
+        """
+        if not self.workbook:
+            logger.error("工作簿未初始化")
+            return
+        
+        sheet = self.workbook.add_worksheet('基础信息')
+        self.worksheets['basic_info'] = sheet
+        
+        # 设置列宽
+        sheet.set_column('A:A', 12)
+        sheet.set_column('B:B', 20)
+        sheet.set_column('C:C', 10)
+        sheet.set_column('D:D', 15)
+        sheet.set_column('E:E', 20)
+        
+        # 写入标题
+        headers = ['股票代码', '公司名称', '市场', '上市日期', '数据源']
+        for col, header in enumerate(headers):
+            sheet.write(0, col, header, self.formats['header'])
+        
+        # 冻结首行
+        sheet.freeze_panes(1, 0)
+        
+        # 写入数据
+        for row, stock in enumerate(stocks, start=1):
+            sheet.write(row, 0, stock.get('code', ''), self.formats['data'])
+            sheet.write(row, 1, stock.get('name', ''), self.formats['data'])
+            sheet.write(row, 2, stock.get('market', ''), self.formats['data'])
+            sheet.write(row, 3, stock.get('list_date', ''), self.formats['date'])
+            sheet.write(row, 4, stock.get('data_source', ''), self.formats['data'])
+        
+        logger.info(f"基础信息表已添加，共{len(stocks)}条记录")
+    
+    def add_industry_sheet(self, industries: Dict[str, Dict]):
+        """
+        添加行业分类表
+        
+        包含列：代码、一级行业、二级行业、三级行业、数据源
+        
+        Args:
+            industries: code -> industry的映射
+        """
+        if not self.workbook:
+            logger.error("工作簿未初始化")
+            return
+        
+        sheet = self.workbook.add_worksheet('行业分类')
+        self.worksheets['industry'] = sheet
+        
+        # 设置列宽
+        sheet.set_column('A:A', 12)
+        sheet.set_column('B:B', 20)
+        sheet.set_column('C:C', 20)
+        sheet.set_column('D:D', 20)
+        sheet.set_column('E:E', 20)
+        
+        # 写入标题
+        headers = ['股票代码', '一级行业', '二级行业', '三级行业', '数据源']
+        for col, header in enumerate(headers):
+            sheet.write(0, col, header, self.formats['header'])
+        
+        # 冻结首行
+        sheet.freeze_panes(1, 0)
+        
+        # 写入数据
+        row = 1
+        for code in sorted(industries.keys()):
+            industry = industries[code]
+            if industry:
+                sheet.write(row, 0, code, self.formats['data'])
+                sheet.write(row, 1, industry.get('l1', ''), self.formats['data'])
+                sheet.write(row, 2, industry.get('l2', ''), self.formats['data'])
+                sheet.write(row, 3, industry.get('l3', ''), self.formats['data'])
+                sheet.write(row, 4, industry.get('source', ''), self.formats['data'])
+                row += 1
+        
+        logger.info(f"行业分类表已添加，共{row-1}条记录")
+    
+    def add_financial_sheet(self, data: List[Dict]):
+        """
+        添加财务数据表
+        
+        包含列：代码、名称、一级行业、2023年资产、2024年资产
+        
+        Args:
+            data: 财务数据列表（包含industry信息）
+        """
+        if not self.workbook:
+            logger.error("工作簿未初始化")
+            return
+        
+        sheet = self.workbook.add_worksheet('财务数据')
+        self.worksheets['financial'] = sheet
+        
+        # 设置列宽
+        sheet.set_column('A:A', 12)
+        sheet.set_column('B:B', 20)
+        sheet.set_column('C:C', 20)
+        sheet.set_column('D:D', 18)
+        sheet.set_column('E:E', 18)
+        
+        # 写入标题
+        headers = ['股票代码', '公司名称', '一级行业', '2023年末资产', '2024年末资产']
+        for col, header in enumerate(headers):
+            sheet.write(0, col, header, self.formats['header'])
+        
+        # 冻结首行
+        sheet.freeze_panes(1, 0)
+        
+        # 写入数据
+        for row, record in enumerate(data, start=1):
+            sheet.write(row, 0, record.get('code', ''), self.formats['data'])
+            sheet.write(row, 1, record.get('name', ''), self.formats['data'])
+            
+            # 获取一级行业
+            industry = record.get('industry', {})
+            l1 = industry.get('l1', '') if industry else ''
+            sheet.write(row, 2, l1, self.formats['data'])
+            
+            # 2023年数据
+            value_2023 = record.get('non_op_real_estate_2023')
+            if value_2023 is not None:
+                sheet.write(row, 3, float(value_2023), self.formats['number'])
+            else:
+                sheet.write(row, 3, '', self.formats['missing'])
+            
+            # 2024年数据
+            value_2024 = record.get('non_op_real_estate_2024')
+            if value_2024 is not None:
+                sheet.write(row, 4, float(value_2024), self.formats['number'])
+            else:
+                sheet.write(row, 4, '', self.formats['missing'])
+        
+        logger.info(f"财务数据表已添加，共{len(data)}条记录")
+    
+    def add_summary_sheet(self, report: Dict):
+        """
+        添加汇总统计表
+        
+        包含：总公司数、代码分布、行业分布、数据完整度等
+        
+        Args:
+            report: 统计报告
+        """
+        if not self.workbook:
+            logger.error("工作簿未初始化")
+            return
+        
+        sheet = self.workbook.add_worksheet('汇总统计')
+        self.worksheets['summary'] = sheet
+        
+        # 设置列宽
+        sheet.set_column('A:A', 25)
+        sheet.set_column('B:B', 18)
+        
+        row = 0
+        
+        # 标题
+        sheet.merge_range(row, 0, row, 1, '数据汇总统计', self.formats['title'])
+        row += 2
+        
+        # 基本统计
+        sheet.write(row, 0, '基本统计', self.formats['header'])
+        sheet.write(row, 1, '', self.formats['header'])
+        row += 1
+        
+        basic_stats = [
+            ('总公司数', report.get('total_stocks', 0)),
+            ('行业分类覆盖数', report.get('stocks_with_industry', 0)),
+            ('2023年数据覆盖数', report.get('stocks_with_2023_data', 0)),
+            ('2024年数据覆盖数', report.get('stocks_with_2024_data', 0)),
+        ]
+        
+        for label, value in basic_stats:
+            sheet.write(row, 0, label, self.formats['data'])
+            sheet.write(row, 1, value, self.formats['stat'])
+            row += 1
+        
+        row += 1
+        
+        # 数据完整度
+        sheet.write(row, 0, '数据完整度分析', self.formats['header'])
+        sheet.write(row, 1, '', self.formats['header'])
+        row += 1
+        
+        total = report.get('total_stocks', 0)
+        if total > 0:
+            completeness_stats = [
+                ('行业分类完整度', report.get('stocks_with_industry', 0) / total),
+                ('2023年数据完整度', report.get('stocks_with_2023_data', 0) / total),
+                ('2024年数据完整度', report.get('stocks_with_2024_data', 0) / total),
+            ]
+            
+            for label, value in completeness_stats:
+                sheet.write(row, 0, label, self.formats['data'])
+                sheet.write(row, 1, value, self.formats['percent'])
+                row += 1
+        
+        row += 1
+        
+        # 数据质量评分
+        quality_report = report.get('quality_report')
+        if quality_report:
+            sheet.write(row, 0, '数据质量评分', self.formats['header'])
+            sheet.write(row, 1, '', self.formats['header'])
+            row += 1
+            
+            quality_score = quality_report.get('overall_score', 0)
+            grade = quality_report.get('grade', 'N/A')
+            
+            sheet.write(row, 0, '综合评分', self.formats['data'])
+            sheet.write(row, 1, quality_score, self.formats['stat'])
+            row += 1
+            
+            sheet.write(row, 0, '评级', self.formats['data'])
+            sheet.write(row, 1, grade, self.formats['stat'])
+            row += 1
+        
+        logger.info("汇总统计表已添加")
+    
+    def add_metadata_sheet(self, metadata: Dict):
+        """
+        添加元数据表
+        
+        包含：采集日期、数据源、版本、说明等
+        
+        Args:
+            metadata: 元数据
+        """
+        if not self.workbook:
+            logger.error("工作簿未初始化")
+            return
+        
+        sheet = self.workbook.add_worksheet('元数据')
+        self.worksheets['metadata'] = sheet
+        
+        # 设置列宽
+        sheet.set_column('A:A', 25)
+        sheet.set_column('B:B', 50)
+        
+        row = 0
+        
+        # 标题
+        sheet.merge_range(row, 0, row, 1, '数据采集元数据', self.formats['title'])
+        row += 2
+        
+        # 写入元数据
+        metadata_items = [
+            ('采集日期', metadata.get('collection_date', '')),
+            ('采集时间', metadata.get('collection_time', '')),
+            ('版本号', metadata.get('version', '')),
+            ('数据来源', metadata.get('sources', '')),
+            ('处理时长', metadata.get('duration', '')),
+            ('文件大小', metadata.get('file_size', '')),
+            ('说明', metadata.get('notes', '')),
+        ]
+        
+        for label, value in metadata_items:
+            sheet.write(row, 0, label, self.formats['header'])
+            sheet.write(row, 1, str(value), self.formats['data'])
+            row += 1
+        
+        logger.info("元数据表已添加")
+    
+    def format_workbook(self):
+        """标准格式化工作簿"""
+        if not self.workbook:
+            logger.error("工作簿未初始化")
+            return
+        
+        # 设置工作簿属性
+        self.workbook.set_properties({
+            'title': 'A股非经营性房地产资产数据',
+            'subject': '上市公司房地产资产数据',
+            'author': 'A股数据采集系统',
+            'created': datetime.now().isoformat()
+        })
+        
+        logger.info("工作簿格式化完成")
+    
+    def close(self):
+        """关闭工作簿"""
+        if self.workbook:
+            self.workbook.close()
+            logger.info("Excel文件已生成")
+
+
+class ExcelReportGenerator:
+    """Excel报告生成器"""
+    
+    @staticmethod
+    def generate_complete_report(
+        stocks: List[Dict],
+        industries: Dict[str, Dict],
+        financial_data: List[Dict],
+        report: Dict,
+        metadata: Dict,
+        filename: str
+    ) -> Optional[str]:
+        """
+        生成完整的Excel报告
+        
+        Args:
+            stocks: 股票基础信息
+            industries: 行业分类
+            financial_data: 财务数据
+            report: 统计报告
+            metadata: 元数据
+            filename: 输出文件名
+            
+        Returns:
+            生成的文件路径或None
+        """
+        try:
+            exporter = ExcelExporter()
+            exporter.create_workbook(filename)
+            
+            # 添加各个表
+            exporter.add_basic_info_sheet(stocks)
+            exporter.add_industry_sheet(industries)
+            exporter.add_financial_sheet(financial_data)
+            exporter.add_summary_sheet(report)
+            exporter.add_metadata_sheet(metadata)
+            
+            # 格式化
+            exporter.format_workbook()
+            
+            # 关闭
+            exporter.close()
+            
+            logger.info(f"Excel报告已生成: {filename}")
+            return filename
+            
+        except Exception as e:
+            logger.error(f"生成Excel报告失败: {e}")
+            return None

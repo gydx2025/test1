@@ -106,9 +106,9 @@ Thumbs.db
 A股非经营性房地产资产_*.xlsx
 temp_result_*.xlsx
 
-# Test files (if any)
-test_*.py
-*_test.py
+# Test files (if any) - excluding important test files
+# test_*.py  # Commented out to keep project test files
+# *_test.py
 
 # Backup files
 *.bak
