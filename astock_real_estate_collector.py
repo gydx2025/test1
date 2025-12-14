@@ -1808,6 +1808,16 @@ def main():
     # 创建数据收集器
     collector = AStockRealEstateDataCollector()
     
+    # 显示并发和快速失败配置状态
+    from config import CONCURRENT_CONFIG, FAST_FAIL_CONFIG, SOURCE_SELECTION_CONFIG
+    if CONCURRENT_CONFIG.get('enabled'):
+        print(f"⚙️  并发获取已启用 (线程数: {CONCURRENT_CONFIG.get('max_workers', 5)}, 批大小: {CONCURRENT_CONFIG.get('batch_size', 100)})")
+    if FAST_FAIL_CONFIG.get('enabled'):
+        print(f"⚡ 快速失败策略已启用 (超时: {FAST_FAIL_CONFIG.get('request_timeout', 10)}秒, 重试: {FAST_FAIL_CONFIG.get('max_retries', 2)}次)")
+    if SOURCE_SELECTION_CONFIG.get('enabled'):
+        print(f"🎯 智能源选择已启用 (最小成功率: {SOURCE_SELECTION_CONFIG.get('min_success_rate', 0.05)}, 最大源数: {SOURCE_SELECTION_CONFIG.get('max_sources_per_stock', 3)})")
+    print("=" * 70)
+    
     try:
         # 询问用户是否要处理全部股票还是测试模式
         print("📋 请选择运行模式:")
