@@ -32,21 +32,42 @@ import random
 from datetime import datetime
 
 from config import (
-    COMPLETE_INDUSTRY_SOURCES, REQUEST_TIMEOUT, API_SOURCE_TIMEOUT, 
-    MAX_RETRIES, BATCH_SIZE, PROGRESS_INTERVAL, MAX_RETRY_ROUNDS, 
-    RETRY_WAIT_TIME, USER_AGENT_POOL
+    COMPLETE_INDUSTRY_SOURCES,
+    REQUEST_TIMEOUT,
+    API_SOURCE_TIMEOUT,
+    MAX_RETRIES,
+    BATCH_SIZE,
+    PROGRESS_INTERVAL,
+    MAX_RETRY_ROUNDS,
+    RETRY_WAIT_TIME,
+    USER_AGENT_POOL,
+    INDUSTRY_FETCH_STOCK_CENTRIC,
+    MIN_SUCCESS_RATE,
+    MAX_SOURCES_PER_STOCK,
+    SKIP_AFTER_FAILURES,
 )
 
 
 @dataclass
 class IndustrySourceStats:
     """数据源统计信息"""
+
     name: str
     enabled: bool
+
+    # 基础统计
     success_count: int = 0
     fail_count: int = 0
     timeout_count: int = 0
     retry_count: int = 0
+
+    # 健康度/熔断控制（运行期动态调整）
+    attempt_count: int = 0
+    consecutive_failures: int = 0
+    disabled: bool = False
+    disabled_reason: str = ""
+
+    # 运行统计
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     http_requests: int = 0
@@ -84,6 +105,18 @@ class IndustryClassificationCompleteGetter:
     def __init__(self, logger=None):
         self.logger = logger
         self.interrupted = False
+
+        self.stock_centric = bool(INDUSTRY_FETCH_STOCK_CENTRIC)
+        self.min_success_rate = float(MIN_SUCCESS_RATE or 0)
+        self.max_sources_per_stock = int(MAX_SOURCES_PER_STOCK or 0)
+        self.skip_after_failures = int(SKIP_AFTER_FAILURES or 0)
+
+        self._min_attempts_before_disable = (
+            max(10, int(1 / self.min_success_rate)) if self.min_success_rate > 0 else 20
+        )
+
+        self._current_timeout: Optional[float] = None
+
         self.sources_config = self._load_sources_config()
         self.source_stats: Dict[str, IndustrySourceStats] = {}
         self.remaining_stocks: Set[str] = set()
@@ -122,73 +155,309 @@ class IndustryClassificationCompleteGetter:
         signal.signal(signal.SIGINT, signal_handler)
 
     def get_complete_classification(
-        self, 
+        self,
         stocks: Sequence[Dict[str, str]],
-        show_progress: bool = True
+        show_progress: bool = True,
     ) -> Dict[str, Dict[str, str]]:
+        """获取完整的行业分类数据。
+
+        默认采用“股票维度”的智能循环：外层遍历股票，内层按优先级/健康度尝试多个源，
+        单只股票一旦成功立即停止尝试后续源。
         """
-        循环使用多个源获取完整的行业分类数据
-        
-        Args:
-            stocks: 股票列表 [{"code": "000001", "name": "平安银行"}]
-            show_progress: 是否显示进度
-        
-        Returns:
-            行业分类结果字典 {stock_code: {industry_data}}
-        """
+
         if not stocks:
             return {}
+
+        if not self.stock_centric:
+            return self._get_complete_classification_source_centric(stocks, show_progress=show_progress)
 
         self.total_stocks = len(stocks)
         self.remaining_stocks = {s.get("code", "") for s in stocks if s.get("code")}
         self.processed_stocks.clear()
         self.used_sources.clear()
         self.round_number = 0
+        self.interrupted = False
 
-        # 按优先级排序数据源
-        sorted_sources = sorted(
-            self.sources_config.items(),
-            key=lambda x: x[1]['priority']
-        )
-
-        # 初始化统计信息
+        sorted_sources = sorted(self.sources_config.items(), key=lambda x: x[1]["priority"])
         self._reset_source_stats()
 
         if show_progress:
+            print("\n开始获取行业分类（股票维度智能循环）...")
             self._display_initial_status(stocks, sorted_sources)
 
-        try:
-            # 循环尝试所有数据源
-            round_num = 1
-            while self.remaining_stocks and round_num <= len(sorted_sources):
-                source_id, source_config = sorted_sources[round_num - 1]
-                
-                if not self._try_source(source_id, source_config, stocks, show_progress):
-                    break  # 用户中断或其他错误
-                
-                # 显示轮次完成统计
-                if show_progress:
-                    self._display_source_summary(round_num, source_id)
-                
-                round_num += 1
-                
-                # 等待间隔
-                if self.remaining_stocks and round_num <= len(sorted_sources):
-                    time.sleep(RETRY_WAIT_TIME)
+        for idx, stock in enumerate(stocks):
+            stock_code = stock.get("code", "")
+            if not stock_code or stock_code not in self.remaining_stocks:
+                continue
 
-            # 如果还有剩余，显示最终统计
+            if self.interrupted:
+                action = self._prompt_interruption_action()
+                if action == "continue":
+                    self.interrupted = False
+                elif action == "skip":
+                    break
+                else:
+                    raise SystemExit(0)
+
+            processed = idx + 1
+            if show_progress and (processed == 1 or processed % PROGRESS_INTERVAL == 0):
+                self._display_stock_centric_progress(processed)
+
+            result = self._fetch_single_stock_multi_source(
+                stock_code=stock_code,
+                stock_name=stock.get("name", ""),
+                base_industry=stock.get("industry", ""),
+                sorted_sources=sorted_sources,
+            )
+
+            if result:
+                self.processed_stocks[stock_code] = result
+                self.remaining_stocks.discard(stock_code)
+
+        now = time.time()
+        for stats in self.source_stats.values():
+            if stats.start_time and not stats.end_time:
+                stats.end_time = now
+
+        self._fill_failed_stocks()
+
+        if show_progress:
+            self._display_final_report()
+
+        return {code: self._result_to_dict(result) for code, result in self.processed_stocks.items()}
+
+    def _get_complete_classification_source_centric(
+        self,
+        stocks: Sequence[Dict[str, str]],
+        show_progress: bool = True,
+    ) -> Dict[str, Dict[str, str]]:
+        """旧版实现：源维度轮次处理（保留以便必要时回退）。"""
+
+        self.total_stocks = len(stocks)
+        self.remaining_stocks = {s.get("code", "") for s in stocks if s.get("code")}
+        self.processed_stocks.clear()
+        self.used_sources.clear()
+        self.round_number = 0
+        self.interrupted = False
+
+        sorted_sources = sorted(self.sources_config.items(), key=lambda x: x[1]["priority"])
+        self._reset_source_stats()
+
+        if show_progress:
+            print("\n开始获取行业分类（源维度轮次处理）...")
+            self._display_initial_status(stocks, sorted_sources)
+
+        round_num = 1
+        while self.remaining_stocks and round_num <= len(sorted_sources):
+            source_id, source_config = sorted_sources[round_num - 1]
+
+            if not self._try_source(source_id, source_config, stocks, show_progress):
+                break
+
             if show_progress:
-                self._display_final_report()
+                self._display_source_summary(round_num, source_id)
 
-            # 填充无法获取的股票
-            self._fill_failed_stocks()
+            round_num += 1
 
-        except KeyboardInterrupt:
-            self.interrupted = True
-            self._handle_interruption()
+            if self.remaining_stocks and round_num <= len(sorted_sources):
+                time.sleep(RETRY_WAIT_TIME)
 
-        return {code: self._result_to_dict(result) 
-                for code, result in self.processed_stocks.items()}
+        self._fill_failed_stocks()
+
+        if show_progress:
+            self._display_final_report()
+
+        return {code: self._result_to_dict(result) for code, result in self.processed_stocks.items()}
+
+    def _fetch_single_stock_multi_source(
+        self,
+        stock_code: str,
+        stock_name: str,
+        base_industry: str,
+        sorted_sources: Sequence[Tuple[str, Dict]],
+    ) -> Optional[IndustryResult]:
+        active_sources = self._get_active_sources(sorted_sources)
+        if self.max_sources_per_stock and self.max_sources_per_stock > 0:
+            active_sources = active_sources[: self.max_sources_per_stock]
+
+        for source_id, source_config in active_sources:
+            if self.interrupted:
+                return None
+            result = self._fetch_single_stock_from_source(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                base_industry=base_industry,
+                source_id=source_id,
+                source_config=source_config,
+            )
+            if result:
+                return result
+
+        return None
+
+    def _get_active_sources(self, sorted_sources: Sequence[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
+        """返回当前“活跃”的数据源列表（按优先级 + 运行期成功率动态调整）。"""
+
+        active: List[Tuple[str, Dict]] = []
+
+        for source_id, cfg in sorted_sources:
+            stats = self.source_stats.get(source_id)
+            if not stats or not cfg.get("enabled", True):
+                continue
+
+            if stats.disabled:
+                continue
+
+            attempts = stats.attempt_count
+            if self.min_success_rate > 0 and attempts >= self._min_attempts_before_disable:
+                success_rate = stats.success_count / attempts if attempts else 0.0
+                if success_rate < self.min_success_rate:
+                    stats.disabled = True
+                    stats.disabled_reason = (
+                        f"success_rate={success_rate:.1%} < {self.min_success_rate:.1%} after {attempts} attempts"
+                    )
+                    msg = f"⚠️ 停用数据源 {stats.name}: {stats.disabled_reason}"
+                    if self.logger:
+                        self.logger.warning(msg)
+                    else:
+                        print(msg)
+                    continue
+
+            active.append((source_id, cfg))
+
+        def sort_key(item: Tuple[str, Dict]) -> Tuple[float, int]:
+            source_id, cfg = item
+            stats = self.source_stats[source_id]
+            attempts = stats.attempt_count
+            if attempts >= self._min_attempts_before_disable and attempts > 0:
+                rate = stats.success_count / attempts
+                return (-rate, int(cfg.get("priority", 999)))
+            return (0.0, int(cfg.get("priority", 999)))
+
+        active.sort(key=sort_key)
+        return active
+
+    def _fetch_single_stock_from_source(
+        self,
+        stock_code: str,
+        stock_name: str,
+        base_industry: str,
+        source_id: str,
+        source_config: Dict,
+    ) -> Optional[IndustryResult]:
+        fetch_method = self._get_fetch_method(source_id)
+        stats = self.source_stats[source_id]
+
+        timeout = float(source_config.get("timeout", REQUEST_TIMEOUT))
+        retry_count = max(1, int(source_config.get("retry_count", 1)))
+
+        if stats.start_time is None:
+            stats.start_time = time.time()
+
+        if source_id not in self.used_sources:
+            self.used_sources.append(source_id)
+
+        local_consecutive_failures = 0
+        for attempt in range(retry_count):
+            if attempt > 0:
+                stats.retry_count += 1
+
+            start = time.perf_counter()
+            try:
+                self._current_timeout = timeout
+                result = fetch_method(stock_code, stock_name, base_industry)
+                elapsed = time.perf_counter() - start
+
+                stats.http_requests += 1
+                stats.attempt_count += 1
+                stats.avg_response_time = (
+                    (stats.avg_response_time * (stats.http_requests - 1)) + elapsed
+                ) / stats.http_requests
+
+                if result:
+                    stats.success_count += 1
+                    stats.consecutive_failures = 0
+                    return result
+
+                stats.fail_count += 1
+                stats.consecutive_failures += 1
+                local_consecutive_failures += 1
+
+            except requests.Timeout:
+                elapsed = time.perf_counter() - start
+                stats.http_requests += 1
+                stats.attempt_count += 1
+                stats.timeout_count += 1
+                stats.consecutive_failures += 1
+                local_consecutive_failures += 1
+                stats.avg_response_time = (
+                    (stats.avg_response_time * (stats.http_requests - 1)) + elapsed
+                ) / stats.http_requests
+
+            except Exception as e:
+                elapsed = time.perf_counter() - start
+                stats.http_requests += 1
+                stats.attempt_count += 1
+                stats.fail_count += 1
+                stats.consecutive_failures += 1
+                local_consecutive_failures += 1
+                stats.avg_response_time = (
+                    (stats.avg_response_time * (stats.http_requests - 1)) + elapsed
+                ) / stats.http_requests
+                if self.logger:
+                    self.logger.debug(f"{stats.name} 获取 {stock_code} 失败: {e}")
+
+            finally:
+                self._current_timeout = None
+
+            if self.skip_after_failures and local_consecutive_failures >= self.skip_after_failures:
+                break
+
+        return None
+
+    def _display_stock_centric_progress(self, processed_count: int):
+        success_count = len(self.processed_stocks)
+        success_rate = (success_count / processed_count * 100) if processed_count else 0.0
+        progress_rate = (processed_count / self.total_stocks * 100) if self.total_stocks else 0.0
+
+        active_sources = len(
+            [
+                s
+                for s in self.source_stats.values()
+                if s.enabled and not s.disabled
+            ]
+        )
+
+        print(
+            f"已处理: {processed_count}/{self.total_stocks} ({progress_rate:.1f}%) | "
+            f"成功: {success_count} ({success_rate:.1f}%) | "
+            f"活跃源: {active_sources}"
+        )
+
+    def _prompt_interruption_action(self) -> str:
+        print(
+            f"\n\n⚠️ 用户中断了行业分类获取！\n\n"
+            f"当前状态:\n"
+            f"- 已成功获取: {len(self.processed_stocks)} / {self.total_stocks}\n"
+            f"- 剩余未获取: {len(self.remaining_stocks)}\n\n"
+            f"选择操作:\n"
+            f"[1] 继续处理剩余股票\n"
+            f"[2] 跳过剩余股票（填充未分类）\n"
+            f"[3] 退出程序\n\n"
+            f"请输入选择 (1/2/3): ",
+            end="",
+        )
+
+        try:
+            choice = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            return "exit"
+
+        if choice == "1":
+            return "continue"
+        if choice == "2":
+            return "skip"
+        return "exit"
 
     def _try_source(
         self, 
@@ -252,6 +521,7 @@ class IndustryClassificationCompleteGetter:
             
             try:
                 # 使用指定源获取行业分类
+                self._current_timeout = float(source_config.get("timeout", REQUEST_TIMEOUT))
                 result = fetch_method(stock_code, stock_info.get("name", ""), stock_info.get("industry", ""))
                 if result:
                     self.processed_stocks[stock_code] = result
@@ -261,7 +531,7 @@ class IndustryClassificationCompleteGetter:
                 else:
                     fail_count += 1
                     stats.fail_count += 1
-                    
+
             except requests.Timeout:
                 fail_count += 1
                 stats.timeout_count += 1
@@ -270,6 +540,8 @@ class IndustryClassificationCompleteGetter:
                 stats.fail_count += 1
                 if self.logger:
                     self.logger.debug(f"{source_name} 获取 {stock_code} 失败: {e}")
+            finally:
+                self._current_timeout = None
 
         # 更新统计信息
         stats.end_time = time.time()
@@ -352,10 +624,10 @@ class IndustryClassificationCompleteGetter:
             
             headers = self._get_random_headers()
             response = requests.get(
-                url, 
+                url,
                 params=params,
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
+                headers=headers,
+                timeout=self._get_request_timeout(),
             )
             
             if response.status_code != 200:
@@ -387,10 +659,10 @@ class IndustryClassificationCompleteGetter:
             headers = self._get_random_headers()
             
             response = requests.get(
-                url, 
-                params={"code": secid}, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
+                url,
+                params={"code": secid},
+                headers=headers,
+                timeout=self._get_request_timeout(),
             )
             
             if response.status_code != 200:
@@ -414,11 +686,11 @@ class IndustryClassificationCompleteGetter:
         try:
             url = f"https://vip.stock.finance.sina.com.cn/corp/go.php/vCI_CorpOtherInfo/stockid/{stock_code}/menu_num/2.phtml"
             headers = self._get_random_headers()
-            
+
             response = requests.get(
-                url, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
+                url,
+                headers=headers,
+                timeout=self._get_request_timeout(),
             )
             
             if response.status_code != 200:
@@ -462,11 +734,11 @@ class IndustryClassificationCompleteGetter:
             symbol = ("sh" if stock_code.startswith("6") else "sz") + stock_code
             url = f"https://qt.gtimg.cn/q={symbol}"
             headers = self._get_random_headers()
-            
+
             response = requests.get(
-                url, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
+                url,
+                headers=headers,
+                timeout=self._get_request_timeout(),
             )
             
             if response.status_code != 200:
@@ -494,11 +766,11 @@ class IndustryClassificationCompleteGetter:
         try:
             url = f"https://quotes.money.163.com/f10/gszl_{stock_code}.html"
             headers = self._get_random_headers()
-            
+
             response = requests.get(
-                url, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
+                url,
+                headers=headers,
+                timeout=self._get_request_timeout(),
             )
             
             if response.status_code >= 400:
@@ -661,6 +933,10 @@ class IndustryClassificationCompleteGetter:
             'Upgrade-Insecure-Requests': '1',
         }
 
+    def _get_request_timeout(self) -> float:
+        timeout = self._current_timeout if self._current_timeout is not None else REQUEST_TIMEOUT
+        return float(timeout)
+
     def _fill_failed_stocks(self):
         """填充无法获取行业分类的股票"""
         for stock_code in self.remaining_stocks:
@@ -693,6 +969,12 @@ class IndustryClassificationCompleteGetter:
             stats.fail_count = 0
             stats.timeout_count = 0
             stats.retry_count = 0
+
+            stats.attempt_count = 0
+            stats.consecutive_failures = 0
+            stats.disabled = False
+            stats.disabled_reason = ""
+
             stats.start_time = None
             stats.end_time = None
             stats.http_requests = 0
@@ -834,10 +1116,10 @@ class IndustryClassificationCompleteGetter:
             print(f"   └─ 平均处理时间: {avg_time:.1f}秒/股票")
 
     def _display_final_report(self):
-        """显示最终覆盖率报告"""
-        if not self.used_sources:
+        """显示最终统计报告（股票维度/源维度均适用）。"""
+        if self.total_stocks <= 0:
             return
-            
+
         total_covered = len(self.processed_stocks) - len(self.remaining_stocks)
         coverage_rate = total_covered / self.total_stocks * 100
         
@@ -850,7 +1132,10 @@ class IndustryClassificationCompleteGetter:
         print(f"   ✅ 覆盖率: {total_covered}/{self.total_stocks} ({coverage_rate:.1f}%)")
         
         if self.remaining_stocks:
-            print(f"   ⚠️ 缺失: {len(self.remaining_stocks)} stocks")
+            missing_list = sorted(self.remaining_stocks)
+            preview = ", ".join(missing_list[:10])
+            more = "..." if len(missing_list) > 10 else ""
+            print(f"   ⚠️ 缺失: {len(self.remaining_stocks)} stocks | 示例: {preview}{more}")
         
         # 按源统计
         print("\n行业分类来源统计:")
@@ -863,7 +1148,25 @@ class IndustryClassificationCompleteGetter:
         for source_name, count in sorted(source_stats_summary.items(), key=lambda x: x[1], reverse=True):
             percentage = count / self.total_stocks * 100
             print(f"   ├─ {source_name}: {count} stocks ({percentage:.1f}%)")
-        
+
+        print("\n数据源健康度:")
+        for source_id, cfg in sorted(self.sources_config.items(), key=lambda x: x[1].get("priority", 999)):
+            stats = self.source_stats.get(source_id)
+            if not stats:
+                continue
+
+            attempts = stats.attempt_count
+            if attempts <= 0:
+                continue
+
+            success_rate = stats.success_count / attempts * 100
+            disabled = f" (disabled: {stats.disabled_reason})" if stats.disabled else ""
+
+            print(
+                f"   ├─ {cfg.get('name', source_id)}: {stats.success_count}/{attempts} ({success_rate:.1f}%) | "
+                f"timeout {stats.timeout_count} | avg {stats.avg_response_time:.2f}s{disabled}"
+            )
+
         # 获取统计
         total_duration = 0
         total_requests = 0

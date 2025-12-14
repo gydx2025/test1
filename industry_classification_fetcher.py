@@ -178,35 +178,40 @@ class IndustryClassificationFetcher:
                 f"⏭️ 跳过 eastmoney_industry_board 批量映射（待补全股票数 {len(remaining)} < min_batch_size {min_batch_size}）"
             )
 
-        # 后续轮：逐个数据源补全
-        for source_name, get_func in self._enabled_sources:
+        # 后续轮：股票维度逐只补全（失败立即切换到下一个源）
+        per_stock_sources = [
+            (source_name, get_func)
+            for source_name, get_func in self._enabled_sources
+            if source_name != "eastmoney_industry_board"
+        ]
+
+        for idx, s in enumerate(stocks):
             if not remaining:
                 break
 
-            if source_name == "eastmoney_industry_board":
+            code = s.get("code", "")
+            if not code or code not in remaining:
                 continue
 
-            before = len(remaining)
-            for s in stocks:
-                code = s.get("code", "")
-                if not code or code not in remaining:
-                    continue
+            name = s.get("name", "")
+            base_industry = s.get("industry", "")
 
-                name = s.get("name", "")
-                base_industry = s.get("industry", "")
-
+            for source_name, get_func in per_stock_sources:
                 try:
                     res = get_func(code, name, base_industry)
                     if res and self.validate_industry_data(res.as_dict()):
                         results[code] = res.as_dict()
                         self.cache[code] = res.as_dict()
                         remaining.remove(code)
-                except Exception:
+                        break
+                except Exception as e:
+                    if self.logger:
+                        self.logger.debug(f"行业数据源{source_name}获取异常: {e}")
                     continue
 
-            if self.logger:
+            if self.logger and (idx + 1) % 500 == 0:
                 self.logger.info(
-                    f"源 {source_name} 获取完毕，成功 {before - len(remaining)} / {before}，剩余 {len(remaining)}"
+                    f"行业分类获取进度: {idx + 1}/{len(stocks)}，已成功 {len(results)}，剩余 {len(remaining)}"
                 )
 
         for code in remaining:
