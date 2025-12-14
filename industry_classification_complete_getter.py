@@ -124,14 +124,16 @@ class IndustryClassificationCompleteGetter:
     def get_complete_classification(
         self, 
         stocks: Sequence[Dict[str, str]],
-        show_progress: bool = True
+        show_progress: bool = True,
+        min_success_rate: float = 0.05
     ) -> Dict[str, Dict[str, str]]:
         """
-        循环使用多个源获取完整的行业分类数据
+        循环使用多个源获取完整的行业分类数据（带智能源选择）
         
         Args:
             stocks: 股票列表 [{"code": "000001", "name": "平安银行"}]
             show_progress: 是否显示进度
+            min_success_rate: 最小成功率阈值，低于此的源将被跳过
         
         Returns:
             行业分类结果字典 {stock_code: {industry_data}}
@@ -157,11 +159,15 @@ class IndustryClassificationCompleteGetter:
         if show_progress:
             self._display_initial_status(stocks, sorted_sources)
 
+        # 智能源过滤：跳过预期成功率太低的源
+        active_sources = self._filter_sources_by_success_rate(sorted_sources, min_success_rate, show_progress)
+
         try:
-            # 循环尝试所有数据源
+            # 循环尝试活跃数据源
             round_num = 1
-            while self.remaining_stocks and round_num <= len(sorted_sources):
-                source_id, source_config = sorted_sources[round_num - 1]
+            for source_id, source_config in active_sources:
+                if not self.remaining_stocks:
+                    break
                 
                 if not self._try_source(source_id, source_config, stocks, show_progress):
                     break  # 用户中断或其他错误
@@ -173,7 +179,7 @@ class IndustryClassificationCompleteGetter:
                 round_num += 1
                 
                 # 等待间隔
-                if self.remaining_stocks and round_num <= len(sorted_sources):
+                if self.remaining_stocks and round_num <= len(active_sources):
                     time.sleep(RETRY_WAIT_TIME)
 
             # 如果还有剩余，显示最终统计
@@ -280,6 +286,60 @@ class IndustryClassificationCompleteGetter:
             self._display_source_complete(source_name, success_count, fail_count, stats, start_time)
         
         return True
+    
+    def _filter_sources_by_success_rate(
+        self,
+        sorted_sources: List[Tuple[str, Dict]],
+        min_success_rate: float,
+        show_progress: bool = True
+    ) -> List[Tuple[str, Dict]]:
+        """
+        根据预期成功率过滤数据源（快速失败策略）
+        
+        跳过历史成功率低于阈值的源，加快处理速度
+        
+        Args:
+            sorted_sources: 排序后的数据源列表
+            min_success_rate: 最小成功率阈值
+            show_progress: 是否显示过滤信息
+        
+        Returns:
+            过滤后的活跃数据源列表
+        """
+        # 已知的低成功率源（基于ticket中的实际数据）
+        low_success_sources = {
+            'tencent_quote': 0.0,      # 腾讯财经：0%
+            'netease_f10': 0.0,        # 网易财经：0%
+            'cninfo': 0.0,             # 巨潮资讯：0%
+        }
+        
+        active_sources = []
+        skipped_sources = []
+        
+        for source_id, source_config in sorted_sources:
+            source_name = source_config.get('name', source_id)
+            
+            # 检查是否是已知的低成功率源
+            if source_id in low_success_sources:
+                expected_rate = low_success_sources[source_id]
+                if expected_rate < min_success_rate:
+                    skipped_sources.append((source_id, source_name, expected_rate))
+                    continue
+            
+            # 添加到活跃源列表
+            active_sources.append((source_id, source_config))
+        
+        # 显示源过滤信息
+        if show_progress and skipped_sources:
+            self.logger.info("=" * 60)
+            self.logger.info("⚡ 智能源选择：跳过低成功率的源")
+            self.logger.info("=" * 60)
+            for source_id, source_name, success_rate in skipped_sources:
+                self.logger.info(f"⏭️ 跳过 {source_name} (成功率 {success_rate*100:.1f}% < {min_success_rate*100:.1f}%)")
+            self.logger.info(f"✅ 将使用 {len(active_sources)} 个高效源进行处理")
+            self.logger.info("=" * 60)
+        
+        return active_sources
 
     def _get_fetch_method(self, source_id: str) -> Callable:
         """根据数据源ID获取相应的获取方法"""
