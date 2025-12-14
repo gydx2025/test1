@@ -87,14 +87,32 @@ INDUSTRY_SOURCES = {
     },
 }
 
-# 请求配置
+# 请求配置 [优化版本]
 REQUEST_CONFIG = {
-    'delay_between_requests': (0.5, 2.0),  # 请求间隔范围(秒) - 随机延迟
-    'max_retries': 5,  # 最大重试次数
-    'retry_delay': 2,  # 重试基础间隔(秒) - 使用指数退避
-    'timeout': 30,  # 默认超时时间
+    'delay_between_requests': (0.2, 0.5),  # 请求间隔范围(秒) - 随机延迟 [优化：降低延迟]
+    'max_retries': 2,  # 最大重试次数 [优化：从5降到2]
+    'retry_delay': 1,  # 重试基础间隔(秒) - 使用指数退避 [优化：从2降到1]
+    'timeout': 10,  # 默认超时时间 [优化：从30降到10]
     'use_exponential_backoff': True,  # 是否使用指数退避算法
     'backoff_factor': 2,  # 指数退避因子
+}
+
+# 并发获取配置 [NEW]
+CONCURRENT_CONFIG = {
+    'enabled': True,  # 是否启用并发获取
+    'max_workers': 5,  # 并发线程数（建议5-10，平衡速度和反爬虫）
+    'batch_size': 100,  # 每批处理的股票数
+    'use_fast_fail': True,  # 是否使用快速失败策略
+    'consecutive_fail_threshold': 3,  # 连续失败次数达到此值后跳过
+}
+
+# 快速失败策略配置 [NEW]
+FAST_FAIL_CONFIG = {
+    'enabled': True,  # 启用快速失败策略
+    'request_timeout': 10,  # 单个请求超时（秒）
+    'max_retries': 2,  # 最大重试次数
+    'retry_delays': [1, 2],  # 重试延迟，总计3秒
+    'min_success_rate': 0.05,  # 最小成功率阈值，低于此的源放弃处理
 }
 
 # 反爬虫配置 - User-Agent轮换池
@@ -192,11 +210,11 @@ INDUSTRY_CACHE_CONFIG = {
 }
 
 # ═══════════════════════════════════════════════════════
-# 行业分类获取超时配置
+# 行业分类获取超时配置 [优化版本]
 # ═══════════════════════════════════════════════════════
-REQUEST_TIMEOUT = 20          # 单个HTTP请求超时 (秒)
-API_SOURCE_TIMEOUT = 300      # 单个源的总超时 (秒，5分钟)
-MAX_RETRIES = 3               # 单个源内的最大重试次数
+REQUEST_TIMEOUT = 10          # 单个HTTP请求超时 (秒) [优化：从20降到10]
+API_SOURCE_TIMEOUT = 60       # 单个源的总超时 (秒) [优化：从300降到60]
+MAX_RETRIES = 2               # 单个源内的最大重试次数 [优化：从3降到2]
 BATCH_SIZE = 100              # 每批处理的股票数
 PROGRESS_INTERVAL = 100       # 每处理100只股票显示一次进度
 

@@ -46,11 +46,12 @@ from config import (
     DATA_SOURCES, REQUEST_CONFIG, USER_AGENT_POOL,
     HEADERS_CONFIG, PROXY_CONFIG, OUTPUT_CONFIG,
     DATA_CLEANING_CONFIG, LOGGING_CONFIG, INDUSTRY_SOURCES,
-    INDUSTRY_CACHE_CONFIG,
+    INDUSTRY_CACHE_CONFIG, CONCURRENT_CONFIG, FAST_FAIL_CONFIG,
 )
 
 from industry_classification_fetcher import IndustryClassificationFetcher
 from industry_classification_complete_getter import IndustryClassificationCompleteGetter
+from concurrent_data_fetcher import ConcurrentDataFetcher, SmartSourceSelector
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -92,11 +93,28 @@ class AStockRealEstateDataCollector:
         )
         self.industry_fetcher.purge_invalid_cache_entries()
         
+        # 并发获取器初始化
+        self.concurrent_fetcher = None
+        if CONCURRENT_CONFIG.get('enabled', True):
+            self.concurrent_fetcher = ConcurrentDataFetcher(
+                fetch_func=self.search_real_estate_data,
+                max_workers=CONCURRENT_CONFIG.get('max_workers', 5),
+                logger_obj=logger
+            )
+        
+        # 智能源选择器
+        self.source_selector = SmartSourceSelector(
+            min_success_rate=FAST_FAIL_CONFIG.get('min_success_rate', 0.05)
+        )
+        
         logger.info("数据收集器初始化完成 - 反爬虫措施已启用")
         logger.info(f"User-Agent池大小: {len(USER_AGENT_POOL)}")
         logger.info(f"请求延迟范围: {REQUEST_CONFIG['delay_between_requests']}")
         logger.info(f"最大重试次数: {REQUEST_CONFIG['max_retries']}")
         logger.info(f"行业分类缓存已启用: {INDUSTRY_CACHE_CONFIG.get('enabled')}")
+        if self.concurrent_fetcher:
+            logger.info(f"✨ 并发获取已启用: {CONCURRENT_CONFIG.get('max_workers', 5)}个线程")
+            logger.info(f"⚡ 快速失败策略已启用")
     
     def _update_headers(self, referer: str = None):
         """更新请求头，轮换User-Agent"""
@@ -1670,9 +1688,14 @@ class AStockRealEstateDataCollector:
             print("🏷️ 第2步：多源循环补全申万行业分类")
             print("="*60)
             try:
-                # 使用新的多源循环补全获取器
+                # 使用新的多源循环补全获取器（带智能源选择）
                 complete_getter = IndustryClassificationCompleteGetter(logger=logger)
-                industries = complete_getter.get_complete_classification(stock_list, show_progress=True)
+                min_success_rate = FAST_FAIL_CONFIG.get('min_success_rate', 0.05)
+                industries = complete_getter.get_complete_classification(
+                    stock_list, 
+                    show_progress=True,
+                    min_success_rate=min_success_rate
+                )
                 
                 # 将结果转换为旧格式以兼容现有代码
                 industries_dict = {code: data for code, data in industries.items()}
@@ -1694,49 +1717,76 @@ class AStockRealEstateDataCollector:
                 success = len([v for v in industries.values() if v.get('source') not in {'unknown', 'error'}])
                 print(f"✅ 备用方案完成：{success}/{total} 只股票获得有效分类")
 
-            # 3. 逐个获取股票数据
+            # 3. 并发获取股票数据
             print("="*60)
-            print("🔍 第3步：获取房地产资产数据")
+            print("🔍 第3步：获取房地产资产数据（并发优化）")
             print("="*60)
-            all_data = []
             
             # 计算预计完成时间
-            avg_delay = sum(REQUEST_CONFIG['delay_between_requests']) / 2 if isinstance(REQUEST_CONFIG['delay_between_requests'], tuple) else REQUEST_CONFIG['delay_between_requests']
-            estimated_time = len(stock_list) * avg_delay
-            print(f"⏱️ 预计需要时间: {estimated_time/60:.1f}分钟 ({estimated_time:.0f}秒)")
-            print(f"📊 平均每只股票延迟: {avg_delay:.2f}秒\n")
-            
-            # 使用进度条
-            with tqdm(total=len(stock_list), desc="处理股票数据", unit="只") as pbar:
-                for i, stock in enumerate(stock_list):
-                    try:
-                        data = self.search_real_estate_data(stock['code'], stock['name'])
-                        stock_basic = {k: v for k, v in stock.items() if k != 'industry'}
-                        data.update(stock_basic)
-                        all_data.append(data)
-                        
-                        pbar.set_postfix({
-                            '当前': f"{stock['code']} {stock['name'][:6]}",
-                            '成功': len(all_data),
-                            '请求': self.request_count
-                        })
-                        pbar.update(1)
-                        
-                    except Exception as e:
-                        logger.warning(f"获取股票 {stock['code']} 数据失败: {e}")
-                        pbar.update(1)
-                        continue
-                    
-                    # 每500个股票保存一次中间结果（如果处理大量数据）
-                    if (i + 1) % 500 == 0 and len(stock_list) > 500:
-                        print(f"\n💾 已处理 {i+1} 只股票，保存中间结果...")
+            if self.concurrent_fetcher:
+                # 并发处理的预计时间
+                max_workers = CONCURRENT_CONFIG.get('max_workers', 5)
+                avg_delay = sum(REQUEST_CONFIG['delay_between_requests']) / 2 if isinstance(REQUEST_CONFIG['delay_between_requests'], tuple) else REQUEST_CONFIG['delay_between_requests']
+                estimated_time = (len(stock_list) / max_workers) * avg_delay
+                print(f"🚀 使用并发模式: {max_workers}个线程")
+                print(f"⏱️ 预计需要时间: {estimated_time/60:.1f}分钟 ({estimated_time:.0f}秒)")
+                print(f"📊 预计提升: ~{max_workers}倍性能提升（从{len(stock_list) * avg_delay/60:.0f}分钟降至{estimated_time/60:.0f}分钟）\n")
+                
+                # 使用并发获取
+                all_data, stats = self.concurrent_fetcher.fetch_concurrent(stock_list, show_progress=True)
+                
+                # 将stock基本信息添加到结果中
+                stock_dict = {stock['code']: stock for stock in stock_list}
+                for item in all_data:
+                    code = item.get('stock_code')
+                    if code and code in stock_dict:
+                        stock_info = stock_dict[code]
+                        for k, v in stock_info.items():
+                            if k not in item and k != 'industry':
+                                item[k] = v
+                
+                print(f"\n✅ 并发获取完成: {len(all_data)}/{len(stock_list)} 只股票")
+                print(f"📊 成功率: {stats.get('success_rate', 0)*100:.1f}%")
+                print(f"⏱️ 总耗时: {stats.get('total_time', 0):.1f}秒，平均{stats.get('avg_time', 0):.2f}秒/个\n")
+            else:
+                # 降级到串行处理（如果并发被禁用）
+                avg_delay = sum(REQUEST_CONFIG['delay_between_requests']) / 2 if isinstance(REQUEST_CONFIG['delay_between_requests'], tuple) else REQUEST_CONFIG['delay_between_requests']
+                estimated_time = len(stock_list) * avg_delay
+                print(f"⏱️ 预计需要时间: {estimated_time/60:.1f}分钟 ({estimated_time:.0f}秒)")
+                print(f"📊 平均每只股票延迟: {avg_delay:.2f}秒\n")
+                
+                all_data = []
+                # 使用进度条
+                with tqdm(total=len(stock_list), desc="处理股票数据", unit="只") as pbar:
+                    for i, stock in enumerate(stock_list):
                         try:
-                            temp_data = self.clean_and_validate_data(all_data)
-                            temp_file = f"temp_result_{i+1}.xlsx"
-                            self.export_to_excel(temp_data, temp_file)
-                            print(f"✅ 中间结果已保存到: {temp_file}\n")
+                            data = self.search_real_estate_data(stock['code'], stock['name'])
+                            stock_basic = {k: v for k, v in stock.items() if k != 'industry'}
+                            data.update(stock_basic)
+                            all_data.append(data)
+                            
+                            pbar.set_postfix({
+                                '当前': f"{stock['code']} {stock['name'][:6]}",
+                                '成功': len(all_data),
+                                '请求': self.request_count
+                            })
+                            pbar.update(1)
+                            
                         except Exception as e:
-                            logger.warning(f"保存中间结果失败: {e}")
+                            logger.warning(f"获取股票 {stock['code']} 数据失败: {e}")
+                            pbar.update(1)
+                            continue
+                        
+                        # 每500个股票保存一次中间结果（如果处理大量数据）
+                        if (i + 1) % 500 == 0 and len(stock_list) > 500:
+                            print(f"\n💾 已处理 {i+1} 只股票，保存中间结果...")
+                            try:
+                                temp_data = self.clean_and_validate_data(all_data)
+                                temp_file = f"temp_result_{i+1}.xlsx"
+                                self.export_to_excel(temp_data, temp_file)
+                                print(f"✅ 中间结果已保存到: {temp_file}\n")
+                            except Exception as e:
+                                logger.warning(f"保存中间结果失败: {e}")
             
             print(f"\n✅ 股票数据获取完成，共获取{len(all_data)}只股票的有效数据")
             
