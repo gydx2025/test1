@@ -19,17 +19,45 @@ from ui.real_estate_query_app import RealEstateQueryApp
 from ui.data_query_service import DataQueryService
 
 
+_SAMPLE_DB_READY = False
+
+
+def ensure_sample_db():
+    """确保默认的 astock_data.db 已写入可查询的示例数据。
+
+    说明：
+    - CI/测试环境默认不会自带 .db 文件。
+    - 复用 test_ui.py 中的示例数据生成逻辑，让 UI/查询相关测试稳定运行。
+    """
+    global _SAMPLE_DB_READY
+    if _SAMPLE_DB_READY:
+        return
+
+    from test_ui import create_sample_data
+
+    create_sample_data()
+    _SAMPLE_DB_READY = True
+
+
 def test_data_query_service():
     """测试数据查询服务"""
     print("=== 测试数据查询服务 ===")
-    
+
+    ensure_sample_db()
     service = DataQueryService()
     
     # 测试1: 基本查询
     df = service.query_data()
     print(f"✅ 基本查询: {len(df)} 条记录")
     assert len(df) > 0, "基本查询应该有数据"
-    
+
+    # 测试1.1: 行业列表加载
+    industry_options = service.get_industry_options()
+    print(f"✅ 行业选项加载: {len(industry_options)} 个")
+    if industry_options:
+        df_ind = service.query_data(industry=industry_options[0])
+        print(f"✅ 行业筛选({industry_options[0]}): {len(df_ind)} 条记录")
+
     # 测试2: 按市场查询
     df_sh = service.query_data(market='沪市')
     print(f"✅ 沪市查询: {len(df_sh)} 条记录")
@@ -63,7 +91,9 @@ def test_data_query_service():
 def test_ui_components():
     """测试UI组件"""
     print("\n=== 测试UI组件 ===")
-    
+
+    ensure_sample_db()
+
     # 创建应用
     app = QApplication(sys.argv)
     
@@ -74,11 +104,17 @@ def test_ui_components():
     assert hasattr(window, 'subject_combo'), "缺少科目下拉框"
     assert hasattr(window, 'subject_input'), "缺少手动输入框"
     assert len(window.time_edits) == 4, "应该有4个时点选择控件"
+    assert hasattr(window, 'preset_quarter_button'), "缺少最近季报预设按钮"
+    assert hasattr(window, 'preset_halfyear_button'), "缺少最近半年报预设按钮"
+    assert hasattr(window, 'preset_annual_button'), "缺少最近年报预设按钮"
+    assert hasattr(window, 'standard_date_combo'), "缺少标准财报期下拉框"
     assert hasattr(window, 'stock_code_input'), "缺少股票代码输入框"
     assert hasattr(window, 'stock_name_input'), "缺少股票名称输入框"
     assert hasattr(window, 'market_combo'), "缺少市场选择下拉框"
+    assert hasattr(window, 'industry_combo'), "缺少行业分类下拉框"
     assert hasattr(window, 'result_table'), "缺少结果表格"
     assert hasattr(window, 'export_button'), "缺少导出按钮"
+    assert window.industry_combo.itemText(0) == '全行业', "行业下拉框默认应为全行业"
     print("✅ 所有UI控件都存在")
     
     # 测试2: 验证控件属性
@@ -97,7 +133,9 @@ def test_ui_components():
 def test_query_functionality():
     """测试查询功能"""
     print("\n=== 测试查询功能 ===")
-    
+
+    ensure_sample_db()
+
     app = QApplication(sys.argv)
     window = RealEstateQueryApp()
     
@@ -113,13 +151,13 @@ def test_query_functionality():
         'time_point_3': None
     }
     
-    # 验证时点解析
+    # 验证时点解析（应解析为 YYYY-MM-DD）
     time_points = []
     for i in range(4):
         date_value = test_params[f'time_point_{i}']
         if date_value and str(date_value).strip():
             if isinstance(date_value, QDate):
-                time_points.append(str(date_value.year()))
+                time_points.append(date_value.toString('yyyy-MM-dd'))
     
     print(f"✅ 解析的时点: {time_points}")
     assert len(time_points) == 1, "应该解析出1个时点"
@@ -129,7 +167,7 @@ def test_query_functionality():
         stock_codes=[],
         stock_names=['平安'],
         market='深市',
-        time_points=['2023'],
+        time_points=['2023-12-31'],
         subject_code=None
     )
     
@@ -143,7 +181,8 @@ def test_query_functionality():
 def test_excel_export():
     """测试Excel导出功能"""
     print("\n=== 测试Excel导出功能 ===")
-    
+
+    ensure_sample_db()
     service = DataQueryService()
     
     # 获取测试数据
@@ -180,7 +219,8 @@ def test_excel_export():
 def test_error_handling():
     """测试错误处理"""
     print("\n=== 测试错误处理 ===")
-    
+
+    ensure_sample_db()
     service = DataQueryService()
     
     # 测试1: 不存在的股票代码

@@ -11,13 +11,27 @@ from datetime import datetime
 import pandas as pd
 
 # PyQt5导入
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                            QHBoxLayout, QGridLayout, QLabel, QComboBox, 
-                            QLineEdit, QPushButton, QTableView, QProgressBar,
-                            QMessageBox, QFileDialog, QDateEdit, QGroupBox,
-                            QFormLayout, QHeaderView, QSplitter)
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QComboBox,
+    QLineEdit,
+    QPushButton,
+    QTableView,
+    QProgressBar,
+    QMessageBox,
+    QFileDialog,
+    QDateEdit,
+    QGroupBox,
+    QHeaderView,
+    QSplitter,
+)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDate
-from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtGui import QFont
 
 # 导入数据查询服务
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -65,36 +79,36 @@ class QueryWorker(QThread):
             
             market = self.query_params.get('market', '全部')
             subject_code = self.query_params.get('subject_code')
-            
-            # 处理时点
-            time_points = []
+            industry = self.query_params.get('industry', '全行业')
+
+            # 处理时点：兼容年份/财报期日期
+            time_points: List[str] = []
             for i in range(4):
                 date_value = self.query_params.get(f'time_point_{i}')
-                if date_value and str(date_value).strip():
-                    try:
-                        # 提取年份
-                        if isinstance(date_value, QDate):
-                            time_points.append(str(date_value.year()))
-                        else:
-                            # 尝试解析字符串格式的日期
-                            if '-' in str(date_value):
-                                time_points.append(str(date_value).split('-')[0])
-                            elif '/' in str(date_value):
-                                time_points.append(str(date_value).split('/')[0])
-                            else:
-                                time_points.append(str(date_value))
-                    except:
-                        pass
-            
+                if not date_value:
+                    continue
+
+                if isinstance(date_value, QDate):
+                    if date_value.isValid() and not date_value.isNull():
+                        time_points.append(date_value.toString('yyyy-MM-dd'))
+                    continue
+
+                token = str(date_value).strip()
+                if token:
+                    # 允许 '2024-06-30' / '2024/06/30' / '2024'
+                    token = token.replace('/', '-')
+                    time_points.append(token)
+
             self.progress.emit(30)
-            
+
             # 执行查询
             df = self.query_service.query_data(
                 stock_codes=stock_codes,
                 stock_names=stock_names,
                 market=market,
                 time_points=time_points,
-                subject_code=subject_code
+                subject_code=subject_code,
+                industry=industry
             )
             
             self.progress.emit(100)
@@ -153,53 +167,74 @@ class RealEstateQueryApp(QMainWindow):
         """创建查询条件组"""
         group = QGroupBox("查询条件")
         layout = QVBoxLayout(group)
-        
-        # 第一行：科目选择和时点选择
+
+        # 第一行：科目选择 + 时点选择
         row1_layout = QHBoxLayout()
-        
+
         # 科目选择
         subject_layout = QVBoxLayout()
-        subject_layout.addWidget(QLabel("财务指标选择:"))
-        
-        # 指标下拉框
+        subject_layout.addWidget(QLabel("资产负债表科目:"))
+
         self.subject_combo = QComboBox()
-        self.subject_combo.addItem("-- 选择财务指标 --", None)
+        self.subject_combo.addItem("-- 选择科目 --", None)
         for subject in self.query_service.available_subjects:
             self.subject_combo.addItem(subject['name'], subject['code'])
         self.subject_combo.currentIndexChanged.connect(self.on_subject_changed)
         subject_layout.addWidget(self.subject_combo)
-        
-        # 手动输入框
+
         self.subject_input = QLineEdit()
         self.subject_input.setPlaceholderText("或手动输入科目名称...")
         subject_layout.addWidget(self.subject_input)
-        
+
         row1_layout.addLayout(subject_layout)
         row1_layout.addStretch()
-        
+
         # 时点选择
         time_layout = QVBoxLayout()
-        time_layout.addWidget(QLabel("时点选择 (最多4个):"))
-        
+        time_layout.addWidget(QLabel("财报期选择 (最多4个):"))
+
         time_points_layout = QHBoxLayout()
         self.time_edits = []
-        for i in range(4):
+        empty_date = QDate(1900, 1, 1)
+        for _ in range(4):
             date_edit = QDateEdit()
             date_edit.setCalendarPopup(True)
-            date_edit.setDate(QDate.currentDate())
+            date_edit.setDisplayFormat("yyyy-MM-dd")
+            date_edit.setMinimumDate(empty_date)
             date_edit.setSpecialValueText("留空")
-            date_edit.clear()  # 设为空
+            date_edit.setDate(empty_date)
             self.time_edits.append(date_edit)
             time_points_layout.addWidget(date_edit)
-        
+
         time_layout.addLayout(time_points_layout)
+
+        # 预设 & 标准时点
+        preset_layout = QHBoxLayout()
+
+        self.preset_quarter_button = QPushButton("最近季报")
+        self.preset_halfyear_button = QPushButton("最近半年报")
+        self.preset_annual_button = QPushButton("最近年报")
+
+        preset_layout.addWidget(self.preset_quarter_button)
+        preset_layout.addWidget(self.preset_halfyear_button)
+        preset_layout.addWidget(self.preset_annual_button)
+        preset_layout.addStretch()
+
+        preset_layout.addWidget(QLabel("标准财报期:"))
+        self.standard_date_combo = QComboBox()
+        self.standard_date_combo.addItem("-- 选择后自动填入 --", None)
+        for date_str, label in self._get_standard_report_date_options():
+            self.standard_date_combo.addItem(f"{date_str} ({label})", date_str)
+        preset_layout.addWidget(self.standard_date_combo)
+
+        time_layout.addLayout(preset_layout)
         row1_layout.addLayout(time_layout)
-        
+
         layout.addLayout(row1_layout)
-        
+
         # 第二行：查询条件
         row2_layout = QHBoxLayout()
-        
+
         # 股票代码
         code_layout = QVBoxLayout()
         code_layout.addWidget(QLabel("股票代码:"))
@@ -207,7 +242,7 @@ class RealEstateQueryApp(QMainWindow):
         self.stock_code_input.setPlaceholderText("多个代码用逗号分隔，留空表示全部")
         code_layout.addWidget(self.stock_code_input)
         row2_layout.addLayout(code_layout)
-        
+
         # 股票名称
         name_layout = QVBoxLayout()
         name_layout.addWidget(QLabel("股票名称:"))
@@ -215,7 +250,7 @@ class RealEstateQueryApp(QMainWindow):
         self.stock_name_input.setPlaceholderText("支持模糊搜索，多个名称用逗号分隔")
         name_layout.addWidget(self.stock_name_input)
         row2_layout.addLayout(name_layout)
-        
+
         # 市场选择
         market_layout = QVBoxLayout()
         market_layout.addWidget(QLabel("市场:"))
@@ -224,30 +259,45 @@ class RealEstateQueryApp(QMainWindow):
             self.market_combo.addItem(market)
         market_layout.addWidget(self.market_combo)
         row2_layout.addLayout(market_layout)
-        
+
+        # 行业选择
+        industry_layout = QVBoxLayout()
+        industry_layout.addWidget(QLabel("行业分类:"))
+        self.industry_combo = QComboBox()
+        self.industry_combo.addItem("全行业")
+        for ind in self.query_service.get_industry_options():
+            self.industry_combo.addItem(ind)
+        industry_layout.addWidget(self.industry_combo)
+        row2_layout.addLayout(industry_layout)
+
         layout.addLayout(row2_layout)
-        
+
         # 第三行：按钮
         button_layout = QHBoxLayout()
-        
+
         self.query_button = QPushButton("查询")
         self.query_button.setMinimumHeight(40)
         self.query_button.setFont(QFont("Arial", 10, QFont.Bold))
         button_layout.addWidget(self.query_button)
-        
+
         self.reset_button = QPushButton("重置")
         self.reset_button.setMinimumHeight(40)
         button_layout.addWidget(self.reset_button)
-        
+
         button_layout.addStretch()
-        
-        # 进度条
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         button_layout.addWidget(self.progress_bar)
-        
+
         layout.addLayout(button_layout)
-        
+
+        # 连接预设相关信号
+        self.preset_quarter_button.clicked.connect(lambda: self.apply_report_date_preset("quarter"))
+        self.preset_halfyear_button.clicked.connect(lambda: self.apply_report_date_preset("halfyear"))
+        self.preset_annual_button.clicked.connect(lambda: self.apply_report_date_preset("annual"))
+        self.standard_date_combo.currentIndexChanged.connect(self.on_standard_date_selected)
+
         return group
     
     def create_result_group(self) -> QGroupBox:
@@ -292,19 +342,118 @@ class RealEstateQueryApp(QMainWindow):
         # 如果选择了下拉框中的项目，清空手动输入框
         if index > 0:
             self.subject_input.clear()
-    
+
+    @staticmethod
+    def _is_time_edit_empty(date_edit: QDateEdit) -> bool:
+        return date_edit.date() == date_edit.minimumDate()
+
+    def _collect_selected_report_dates(self) -> List[str]:
+        dates: List[str] = []
+        seen = set()
+        for date_edit in self.time_edits:
+            if self._is_time_edit_empty(date_edit):
+                continue
+            d = date_edit.date().toString('yyyy-MM-dd')
+            if d in seen:
+                continue
+            seen.add(d)
+            dates.append(d)
+        return dates
+
+    def _add_report_date_to_next_slot(self, report_date: QDate) -> None:
+        if not report_date or report_date.isNull() or not report_date.isValid():
+            return
+
+        report_date_str = report_date.toString('yyyy-MM-dd')
+        if report_date_str in set(self._collect_selected_report_dates()):
+            QMessageBox.information(self, "提示", f"时点 {report_date_str} 已经选择过")
+            return
+
+        for date_edit in self.time_edits:
+            if self._is_time_edit_empty(date_edit):
+                date_edit.setDate(report_date)
+                return
+
+        QMessageBox.warning(self, "警告", "最多只能选择4个时点")
+
+    def _get_latest_quarter_end(self) -> QDate:
+        today = datetime.now().date()
+        year = today.year
+
+        candidates = [
+            (12, 31),
+            (9, 30),
+            (6, 30),
+            (3, 31),
+        ]
+        for month, day in candidates:
+            d = datetime(year, month, day).date()
+            if today >= d:
+                return QDate(year, month, day)
+
+        # 如果在 Q1 之前，则取上一年年报
+        return QDate(year - 1, 12, 31)
+
+    def _get_latest_halfyear_end(self) -> QDate:
+        today = datetime.now().date()
+        year = today.year
+        half = datetime(year, 6, 30).date()
+        if today >= half:
+            return QDate(year, 6, 30)
+        return QDate(year - 1, 6, 30)
+
+    def _get_latest_annual_end(self) -> QDate:
+        today = datetime.now().date()
+        year = today.year
+        annual = datetime(year, 12, 31).date()
+        if today >= annual:
+            return QDate(year, 12, 31)
+        return QDate(year - 1, 12, 31)
+
+    def apply_report_date_preset(self, preset: str) -> None:
+        """将预设时点填入到下一个空位（最多4个）。"""
+        if preset == 'quarter':
+            q = self._get_latest_quarter_end()
+            self._add_report_date_to_next_slot(q)
+        elif preset == 'halfyear':
+            h = self._get_latest_halfyear_end()
+            self._add_report_date_to_next_slot(h)
+        elif preset == 'annual':
+            a = self._get_latest_annual_end()
+            self._add_report_date_to_next_slot(a)
+
+    def _get_standard_report_date_options(self, years_back: int = 6) -> List[tuple[str, str]]:
+        """生成标准财报期列表（用于下拉框展示）。"""
+        year = datetime.now().year
+        labels = [
+            (12, 31, '年报'),
+            (9, 30, '三季报'),
+            (6, 30, '半年报'),
+            (3, 31, '一季报'),
+        ]
+
+        options: List[tuple[str, str]] = []
+        for y in range(year, year - years_back - 1, -1):
+            for m, d, label in labels:
+                options.append((f"{y:04d}-{m:02d}-{d:02d}", label))
+        return options
+
+    def on_standard_date_selected(self, index: int) -> None:
+        date_str = self.standard_date_combo.currentData()
+        if not date_str:
+            return
+
+        qdate = QDate.fromString(str(date_str), 'yyyy-MM-dd')
+        if qdate.isValid():
+            self._add_report_date_to_next_slot(qdate)
+
+        # 复位，避免重复触发
+        self.standard_date_combo.setCurrentIndex(0)
+
     def validate_input(self) -> bool:
         """验证输入参数"""
-        # 检查时点数量
-        selected_dates = []
-        for date_edit in self.time_edits:
-            if not date_edit.isNull():
-                selected_dates.append(date_edit.date())
-        
-        if len(selected_dates) > 4:
-            QMessageBox.warning(self, "警告", "最多只能选择4个时点")
-            return False
-        
+        selected_dates = self._collect_selected_report_dates()
+
         # 检查是否有至少一个时点
         if not selected_dates:
             reply = QMessageBox.question(
@@ -313,27 +462,27 @@ class RealEstateQueryApp(QMainWindow):
             )
             if reply != QMessageBox.Yes:
                 return False
-        
+
         return True
-    
+
     def start_query(self):
         """开始查询"""
         if not self.validate_input():
             return
-        
-        # 收集查询参数
+
         query_params = {
             'stock_codes': self.stock_code_input.text(),
             'stock_names': self.stock_name_input.text(),
             'market': self.market_combo.currentText(),
+            'industry': self.industry_combo.currentText(),
             'subject_code': self.subject_combo.currentData()
         }
-        
-        # 添加时点参数
+
         for i, date_edit in enumerate(self.time_edits):
-            query_params[f'time_point_{i}'] = date_edit.date() if not date_edit.isNull() else None
-        
-        # 开始查询
+            query_params[f'time_point_{i}'] = (
+                date_edit.date().toString('yyyy-MM-dd') if not self._is_time_edit_empty(date_edit) else None
+            )
+
         self.execute_query(query_params)
     
     def execute_query(self, query_params: Dict):
@@ -387,14 +536,20 @@ class RealEstateQueryApp(QMainWindow):
         self.reset_button.setEnabled(enabled)
         self.subject_combo.setEnabled(enabled)
         self.subject_input.setEnabled(enabled)
-        self.time_edits[0].setEnabled(enabled)
-        self.time_edits[1].setEnabled(enabled)
-        self.time_edits[2].setEnabled(enabled)
-        self.time_edits[3].setEnabled(enabled)
+
+        for date_edit in self.time_edits:
+            date_edit.setEnabled(enabled)
+
+        self.preset_quarter_button.setEnabled(enabled)
+        self.preset_halfyear_button.setEnabled(enabled)
+        self.preset_annual_button.setEnabled(enabled)
+        self.standard_date_combo.setEnabled(enabled)
+
         self.stock_code_input.setEnabled(enabled)
         self.stock_name_input.setEnabled(enabled)
         self.market_combo.setEnabled(enabled)
-        
+        self.industry_combo.setEnabled(enabled)
+
         if enabled:
             self.export_button.setEnabled(not self.current_data.empty)
     
@@ -468,23 +623,23 @@ class RealEstateQueryApp(QMainWindow):
     
     def reset_form(self):
         """重置表单"""
-        # 重置控件值
         self.subject_combo.setCurrentIndex(0)
         self.subject_input.clear()
-        
+
         for date_edit in self.time_edits:
-            date_edit.clear()
-        
+            date_edit.setDate(date_edit.minimumDate())
+
+        self.standard_date_combo.setCurrentIndex(0)
+
         self.stock_code_input.clear()
         self.stock_name_input.clear()
         self.market_combo.setCurrentIndex(0)
-        
-        # 清空结果
+        self.industry_combo.setCurrentIndex(0)
+
         self.current_data = pd.DataFrame()
         self.result_table.setModel(None)
         self.export_button.setEnabled(False)
-        
-        # 重置状态
+
         self.statusBar().showMessage("已重置")
     
     def closeEvent(self, event):
