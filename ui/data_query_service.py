@@ -7,8 +7,7 @@
 import pandas as pd
 import sqlite3
 import logging
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from typing import List, Dict
 import os
 import re
 
@@ -30,31 +29,24 @@ class DataQueryService:
         self.markets = ['全部', '沪市', '深市', '北市']
     
     def _load_available_subjects(self) -> List[Dict]:
-        """
-        加载资产负债表科目列表
-        
+        """加载资产负债表科目列表。
+
+        说明：
+        - UI 的科目下拉框只展示资产负债表项目，不包含利润表/现金流表等。
+        - 列表顺序尽量贴近资产负债表的展示顺序（资产 -> 负债 -> 所有者权益）。
+
         Returns:
             科目列表
         """
         subjects = [
-            {'code': 'total_assets', 'name': '总资产'},
+            {'code': 'non_op_real_estate', 'name': '非经营性房地产资产'},
+            {'code': 'total_assets', 'name': '资产总计'},
             {'code': 'current_assets', 'name': '流动资产合计'},
             {'code': 'non_current_assets', 'name': '非流动资产合计'},
             {'code': 'total_liabilities', 'name': '负债合计'},
             {'code': 'current_liabilities', 'name': '流动负债合计'},
             {'code': 'non_current_liabilities', 'name': '非流动负债合计'},
             {'code': 'owners_equity', 'name': '所有者权益合计'},
-            {'code': 'operating_income', 'name': '营业收入'},
-            {'code': 'operating_cost', 'name': '营业成本'},
-            {'code': 'net_profit', 'name': '净利润'},
-            {'code': 'total_revenue', 'name': '营业总收入'},
-            {'code': 'total_cost', 'name': '营业总成本'},
-            {'code': 'business_income', 'name': '主营业务收入'},
-            {'code': 'business_cost', 'name': '主营业务成本'},
-            {'code': 'management_expense', 'name': '管理费用'},
-            {'code': 'selling_expense', 'name': '销售费用'},
-            {'code': 'rd_expense', 'name': '研发费用'},
-            {'code': 'finance_expense', 'name': '财务费用'}
         ]
         return subjects
     
@@ -63,17 +55,20 @@ class DataQueryService:
                    stock_names: List[str] = None,
                    market: str = '全部',
                    time_points: List[str] = None,
-                   subject_code: str = None) -> pd.DataFrame:
-        """
-        查询数据
-        
+                   subject_code: str = None,
+                   industry: str = None) -> pd.DataFrame:
+        """查询数据。
+
         Args:
             stock_codes: 股票代码列表
-            stock_names: 股票名称列表
+            stock_names: 股票名称列表（支持模糊匹配）
             market: 市场类型
-            time_points: 时点列表
+            time_points: 时点列表。
+                - 兼容传入年份（如 '2023'）
+                - 也支持传入财报期日期（如 '2024-06-30'），会自动提取年份做兼容过滤
             subject_code: 科目代码
-            
+            industry: 行业筛选（申万一级行业）。None/全行业 表示不筛选
+
         Returns:
             查询结果DataFrame
         """
@@ -116,21 +111,39 @@ class DataQueryService:
             if market and market != '全部':
                 market_map = {
                     '沪市': 'SH',
-                    '深市': 'SZ', 
+                    '深市': 'SZ',
                     '北市': 'BJ'
                 }
                 if market in market_map:
                     sql += " AND s.market = ?"
                     params.append(market_map[market])
-            
-            # 时点过滤
+
+            # 行业过滤（申万一级）
+            if industry and industry != '全行业':
+                sql += " AND i.l1 = ?"
+                params.append(industry)
+
+            # 时点过滤（兼容年份/财报期日期）
             if time_points:
-                year_conditions = []
-                for year in time_points:
-                    if year:
+                years: List[str] = []
+                for tp in time_points:
+                    if not tp:
+                        continue
+                    token = str(tp).strip()
+                    if not token:
+                        continue
+
+                    # '2024-06-30' -> '2024'
+                    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", token):
+                        years.append(token[:4])
+                    elif re.fullmatch(r"\d{4}", token):
+                        years.append(token)
+
+                if years:
+                    year_conditions = []
+                    for y in years:
                         year_conditions.append("fd.year = ?")
-                        params.append(year)
-                if year_conditions:
+                        params.append(y)
                     sql += f" AND ({' OR '.join(year_conditions)})"
             
             # 科目过滤（这里使用现有的非经营性房地产资产字段）
@@ -158,9 +171,8 @@ class DataQueryService:
             raise
     
     def get_stock_list(self) -> pd.DataFrame:
-        """
-        获取股票列表
-        
+        """获取股票列表。
+
         Returns:
             股票列表DataFrame
         """
@@ -175,6 +187,29 @@ class DataQueryService:
         except Exception as e:
             logger.error(f"获取股票列表失败: {str(e)}")
             return pd.DataFrame()
+
+    def get_industry_options(self) -> List[str]:
+        """获取行业筛选下拉框的候选项（申万一级行业）。
+
+        Returns:
+            行业列表（不含“全行业”）
+        """
+        try:
+            sql = """
+                SELECT DISTINCT l1
+                FROM industries
+                WHERE l1 IS NOT NULL AND TRIM(l1) != ''
+                ORDER BY l1
+            """
+            df = pd.read_sql_query(sql, self._get_connection())
+            if df.empty:
+                return []
+
+            industries = [str(x).strip() for x in df['l1'].tolist() if str(x).strip()]
+            return industries
+        except Exception as e:
+            logger.error(f"获取行业列表失败: {str(e)}")
+            return []
     
     def export_to_excel(self, df: pd.DataFrame, file_path: str) -> bool:
         """
