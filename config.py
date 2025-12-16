@@ -344,3 +344,15 @@ SOURCE_SELECTION_CONFIG = {
 # ═══════════════════════════════════════════════════════
 
 REQUEST_DELAY_RANGE = (0.2, 0.5)       # 并发模式下的延迟范围（秒）
+
+# ═══════════════════════════════════════════════════════
+# 本地缓存层配置（SQLite + pickle snapshot）
+# ═══════════════════════════════════════════════════════
+
+LOCAL_CACHE_CONFIG = {
+    'enabled': True,
+    'cache_dir': './local_cache',
+    'ttl_seconds': 7 * 24 * 3600,          # 默认TTL（秒）
+    'backup_retention_days': 14,           # 备份保留天数
+    'default_version': 'v3.0.0',           # 缓存版本（版本不一致将触发重建）
+}
