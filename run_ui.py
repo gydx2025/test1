@@ -15,13 +15,22 @@ def main():
     """主函数"""
     try:
         # 尝试导入PyQt5 UI
+        from PyQt5.QtWidgets import QApplication
         from ui.real_estate_query_app import RealEstateQueryApp
         
         print("正在启动A股非经营性房地产资产查询系统...")
         
-        # 创建并运行应用
-        app = RealEstateQueryApp()
-        app.show()
+        # 创建QApplication
+        app = QApplication(sys.argv)
+        
+        # 设置应用程序信息
+        app.setApplicationName("A股非经营性房地产资产查询系统")
+        app.setApplicationVersion("1.0")
+        app.setOrganizationName("DataQuery System")
+        
+        # 创建主窗口
+        window = RealEstateQueryApp()
+        window.show()
         
         print("UI启动成功！")
         print("使用说明:")
