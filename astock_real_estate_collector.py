@@ -36,7 +36,7 @@ import random
 import pickle
 import json
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
@@ -112,7 +112,16 @@ class AStockRealEstateDataCollector:
             logger=logger,
         )
         self.industry_fetcher.purge_invalid_cache_entries()
-        
+
+        # 资产负债表科目元数据缓存（用于UI选择科目/指标）
+        self._balance_sheet_subjects: Optional[List[str]] = None
+        self._balance_sheet_subjects_cache_dir = os.path.join("./cache", "balance_sheet")
+        self._balance_sheet_subjects_cache_path = os.path.join(
+            self._balance_sheet_subjects_cache_dir,
+            "balance_sheet_subjects.json",
+        )
+        self._balance_sheet_subjects_ttl_seconds = int(LOCAL_CACHE_CONFIG.get("ttl_seconds", 7 * 24 * 3600))
+
         logger.info("数据收集器初始化完成 - 反爬虫措施已启用")
         logger.info(f"User-Agent池大小: {len(USER_AGENT_POOL)}")
         logger.info(f"请求延迟范围: {REQUEST_CONFIG['delay_between_requests']}")
@@ -1517,59 +1526,490 @@ class AStockRealEstateDataCollector:
                 'source': 'error',
             }
     
-    def search_real_estate_data(self, stock_code: str, stock_name: str) -> Dict:
-        """
-        搜索特定股票的非经营性房地产数据
-        
-        数据源优先级：
-        1. 巨潮资讯 (cninfo) - 官方数据源
-        2. 东方财富 (eastmoney) - 需要反爬虫处理
-        3. 新浪财经 (sina) - 备选方案
-        """
-        result = {
-            'stock_code': stock_code,
-            'stock_name': stock_name,
-            'real_estate_2023': None,
-            'real_estate_2024': None
-        }
-        
+    def _load_balance_sheet_subjects_cache(self) -> Optional[List[str]]:
+        if not os.path.exists(self._balance_sheet_subjects_cache_path):
+            return None
+
         try:
-            # 按优先级尝试从多个数据源获取数据
-            # 优先级：cninfo > eastmoney > sina
-            data_sources = [
-                ('cninfo', self._get_data_from_cninfo),
-                ('eastmoney', self._get_data_from_eastmoney),
-                ('sina', self._get_data_from_sina),
-            ]
-            
-            for source_name, data_source in data_sources:
-                # 检查数据源是否启用
-                if not DATA_SOURCES.get(source_name, {}).get('enabled', False):
-                    continue
-                
-                try:
-                    data = data_source(stock_code, stock_name)
-                    if data:
-                        result.update(data)
-                        logger.debug(f"从{source_name}获取到{stock_code}数据")
-                        break
-                except Exception as e:
-                    logger.debug(f"数据源{source_name}获取失败: {e}")
-                    continue
-            
-            # 模拟数据生成（实际使用时应该从真实API获取）
-            if result['real_estate_2023'] is None:
-                result['real_estate_2023'] = self._generate_mock_data(stock_code, '2023')
-            if result['real_estate_2024'] is None:
-                result['real_estate_2024'] = self._generate_mock_data(stock_code, '2024')
-            
-            # 获取申万行业分类
-            industry_info = self.get_shenwan_industry(stock_code, stock_name)
-            result.update(industry_info)
-                
+            with open(self._balance_sheet_subjects_cache_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            timestamp = payload.get("timestamp")
+            subjects = payload.get("subjects")
+            if not timestamp or not isinstance(subjects, list):
+                return None
+
+            if time.time() - float(timestamp) > self._balance_sheet_subjects_ttl_seconds:
+                return None
+
+            return [str(x) for x in subjects]
+        except Exception as e:
+            logger.debug(f"读取资产负债表科目缓存失败，将重新拉取: {e}")
+            return None
+
+    def _save_balance_sheet_subjects_cache(self, subjects: List[str], source: str) -> None:
+        try:
+            os.makedirs(self._balance_sheet_subjects_cache_dir, exist_ok=True)
+            payload = {
+                "timestamp": time.time(),
+                "source": source,
+                "subjects": subjects,
+            }
+            with open(self._balance_sheet_subjects_cache_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.debug(f"保存资产负债表科目缓存失败: {e}")
+
+    def _fetch_balance_sheet_subjects_from_source(self) -> List[str]:
+        sample_symbol = "SH600519"
+        df = self._fetch_balance_sheet_by_report_em(sample_symbol)
+
+        meta_columns = {
+            "SECUCODE",
+            "SECURITY_CODE",
+            "SECURITY_NAME_ABBR",
+            "ORG_CODE",
+            "ORG_TYPE",
+            "REPORT_DATE",
+            "REPORT_TYPE",
+            "REPORT_DATE_NAME",
+            "SECURITY_TYPE_CODE",
+            "NOTICE_DATE",
+            "UPDATE_DATE",
+            "CURRENCY",
+            "OPINION_TYPE",
+            "OSOPINION_TYPE",
+            "LISTING_STATE",
+        }
+
+        subjects: List[str] = []
+        for col in df.columns:
+            if not isinstance(col, str):
+                continue
+            if col in meta_columns:
+                continue
+            if col.endswith("_YOY"):
+                continue
+            subjects.append(col)
+
+        subjects = sorted(set(subjects))
+        if not subjects:
+            raise RuntimeError("从数据源解析出的资产负债表科目列表为空")
+
+        return subjects
+
+    def get_balance_sheet_subjects(self, force_refresh: bool = False) -> List[str]:
+        """获取资产负债表可选科目列表（带磁盘缓存）。
+
+        Returns:
+            科目列表（与 AkShare/Eastmoney 返回字段保持一致）。
+        """
+        if self._balance_sheet_subjects is not None and not force_refresh:
+            return self._balance_sheet_subjects
+
+        if not force_refresh:
+            cached = self._load_balance_sheet_subjects_cache()
+            if cached:
+                self._balance_sheet_subjects = cached
+                return cached
+
+        subjects = self._fetch_balance_sheet_subjects_from_source()
+        self._save_balance_sheet_subjects_cache(subjects, source="akshare.stock_balance_sheet_by_report_em")
+        self._balance_sheet_subjects = subjects
+        return subjects
+
+    @staticmethod
+    def _normalize_indicator_name(name: str) -> str:
+        name = str(name).strip()
+        name = re.sub(r"\s+", "", name)
+        name = name.replace("（", "(").replace("）", ")")
+        name = name.replace("－", "-")
+        return name.upper()
+
+    def _resolve_balance_sheet_indicator(self, indicator_name: str, subjects: Sequence[str]) -> str:
+        """将用户输入/别名解析为受支持的资产负债表科目字段名。"""
+        if not indicator_name or not str(indicator_name).strip():
+            raise ValueError("indicator_name 不能为空")
+
+        alias_map = {
+            "非经营性房地产": "INVEST_REALESTATE",
+            "非经营性房地产资产": "INVEST_REALESTATE",
+            "投资性房地产": "INVEST_REALESTATE",
+            "投资性房产": "INVEST_REALESTATE",
+            "资产总计": "TOTAL_ASSETS",
+            "总资产": "TOTAL_ASSETS",
+            "负债合计": "TOTAL_LIABILITIES",
+            "总负债": "TOTAL_LIABILITIES",
+            "所有者权益合计": "TOTAL_EQUITY",
+            "货币资金": "MONETARYFUNDS",
+            "固定资产": "FIXED_ASSET",
+        }
+
+        subjects_set = set(subjects)
+
+        direct = str(indicator_name).strip()
+        if direct in subjects_set:
+            return direct
+
+        # 允许用户输入形如 "投资性房地产(INVEST_REALESTATE)"
+        m = re.search(r"\(([A-Z0-9_]+)\)", direct.upper())
+        if m and m.group(1) in subjects_set:
+            return m.group(1)
+
+        mapped = alias_map.get(direct)
+        if mapped and mapped in subjects_set:
+            return mapped
+
+        norm = self._normalize_indicator_name(direct)
+        for subject in subjects:
+            if self._normalize_indicator_name(subject) == norm:
+                return subject
+
+        # 子串/模糊匹配：尽量给 UI 一个可用的结果
+        fuzzy_matches = [s for s in subjects if norm in self._normalize_indicator_name(s)]
+        if len(fuzzy_matches) == 1:
+            return fuzzy_matches[0]
+
+        if fuzzy_matches:
+            raise ValueError(
+                f"indicator_name='{indicator_name}' 匹配到多个科目: {fuzzy_matches[:10]}... 请使用更精确的字段名"
+            )
+
+        raise ValueError(f"indicator_name='{indicator_name}' 不在受支持的资产负债表科目列表中")
+
+    @staticmethod
+    def _validate_periods(periods: Union[str, Sequence[str]]) -> List[str]:
+        if isinstance(periods, str):
+            periods_list = [periods]
+        else:
+            periods_list = list(periods)
+
+        if not periods_list:
+            raise ValueError("periods 不能为空")
+        if len(periods_list) > 4:
+            raise ValueError("最多支持 4 个时点")
+
+        out: List[str] = []
+        seen = set()
+        for p in periods_list:
+            p_str = str(p).strip()
+            try:
+                dt = datetime.strptime(p_str, "%Y-%m-%d")
+            except Exception as e:
+                raise ValueError(f"时点格式必须为 YYYY-MM-DD, 当前为 '{p_str}'") from e
+
+            canon = dt.strftime("%Y-%m-%d")
+            if canon in seen:
+                continue
+            seen.add(canon)
+            out.append(canon)
+        return out
+
+    @staticmethod
+    def _normalize_market_filter(market: Optional[Union[str, Sequence[str]]]) -> Optional[set[str]]:
+        if market is None:
+            return None
+
+        if isinstance(market, str):
+            tokens = [x for x in re.split(r"[\s,;]+", market.strip()) if x]
+        else:
+            tokens = [str(x).strip() for x in market if str(x).strip()]
+
+        mapping = {
+            "SH": "上海",
+            "沪": "上海",
+            "上海": "上海",
+            "SZ": "深圳",
+            "深": "深圳",
+            "深圳": "深圳",
+            "BJ": "北交所",
+            "北": "北交所",
+            "北京": "北交所",
+            "北交所": "北交所",
+        }
+
+        result: set[str] = set()
+        for t in tokens:
+            key = t.upper()
+            mapped = mapping.get(key)
+            if not mapped:
+                raise ValueError(f"market 不支持: {market}，可选值: 上海/深圳/北交所 或 SH/SZ/BJ")
+            result.add(mapped)
+
+        return result
+
+    @staticmethod
+    def _parse_stock_filter(stock_filter: Optional[Union[str, Sequence[str]]]) -> List[str]:
+        if stock_filter is None:
+            return []
+        if isinstance(stock_filter, str):
+            return [x for x in re.split(r"[\s,;]+", stock_filter.strip()) if x]
+        return [str(x).strip() for x in stock_filter if str(x).strip()]
+
+    @staticmethod
+    def _match_stock_filter(stock: Dict[str, Any], tokens: Sequence[str]) -> bool:
+        if not tokens:
+            return True
+
+        code = str(stock.get("code") or stock.get("stock_code") or "")
+        name = str(stock.get("name") or stock.get("stock_name") or "")
+        haystack = f"{code} {name}".upper()
+
+        for t in tokens:
+            t = str(t).strip().upper()
+            if not t:
+                continue
+            if t.isdigit() and len(t) == 6 and t == code:
+                return True
+            if t in haystack:
+                return True
+        return False
+
+    def _filter_stock_list(
+        self,
+        stocks: List[Dict[str, Any]],
+        stock_filter: Optional[Union[str, Sequence[str]]] = None,
+        market: Optional[Union[str, Sequence[str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        tokens = self._parse_stock_filter(stock_filter)
+        market_set = self._normalize_market_filter(market)
+
+        out: List[Dict[str, Any]] = []
+        for s in stocks:
+            m = s.get("market")
+            if market_set and m not in market_set:
+                continue
+            if not self._match_stock_filter(s, tokens):
+                continue
+            out.append(s)
+        return out
+
+    @staticmethod
+    def _to_akshare_symbol(stock_code: str, market: Optional[str]) -> str:
+        code = str(stock_code).strip()
+        if not (len(code) == 6 and code.isdigit()):
+            raise ValueError(f"股票代码无效: {stock_code}")
+
+        if market in {"上海", "SH", "沪", "1"}:
+            return f"SH{code}"
+        if market in {"深圳", "SZ", "深", "0"}:
+            return f"SZ{code}"
+        if market in {"北交所", "BJ", "北京"}:
+            return f"BJ{code}"
+
+        # 无 market 时按规则猜测
+        return f"SH{code}" if code.startswith("6") else f"SZ{code}"
+
+    def _fetch_balance_sheet_by_report_em(self, symbol: str) -> pd.DataFrame:
+        try:
+            import akshare as ak
+        except Exception as e:
+            raise RuntimeError(f"无法导入 akshare，无法调用资产负债表接口: {e}")
+
+        last_error: Optional[Exception] = None
+        max_retries = int(REQUEST_CONFIG.get("max_retries", 3))
+
+        for attempt in range(max_retries):
+            try:
+                if self.request_count > 0:
+                    time.sleep(self._get_random_delay())
+
+                if attempt > 0:
+                    time.sleep(self._get_backoff_delay(attempt - 1))
+                    self.retry_count += 1
+
+                df = ak.stock_balance_sheet_by_report_em(symbol=symbol)
+                self.request_count += 1
+
+                if df is None or df.empty:
+                    raise RuntimeError("返回空数据")
+
+                return df
+            except Exception as e:
+                last_error = e
+                self.failed_request_count += 1
+                logger.warning(f"资产负债表获取失败 symbol={symbol} attempt={attempt + 1}/{max_retries}: {e}")
+
+        raise RuntimeError(f"资产负债表获取失败 symbol={symbol}: {last_error}")
+
+    @staticmethod
+    def _extract_report_date_strings(df: pd.DataFrame) -> pd.Series:
+        candidates = [
+            "REPORT_DATE",
+            "报告期",
+            "REPORTDATE",
+        ]
+        for col in candidates:
+            if col not in df.columns:
+                continue
+            series = df[col]
+            if pd.api.types.is_datetime64_any_dtype(series):
+                return series.dt.strftime("%Y-%m-%d")
+            parsed = pd.to_datetime(series, errors="coerce")
+            if pd.api.types.is_datetime64_any_dtype(parsed):
+                return parsed.dt.strftime("%Y-%m-%d")
+        raise RuntimeError("资产负债表数据中未找到报告期字段")
+
+    @staticmethod
+    def _coerce_numeric(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    def _query_balance_sheet_indicator_single(
+        self,
+        stock_code: str,
+        stock_name: str,
+        market: Optional[str],
+        periods: Sequence[str],
+        indicator: str,
+    ) -> Dict[str, Any]:
+        periods_valid = self._validate_periods(periods)
+        ak_symbol = self._to_akshare_symbol(stock_code, market)
+
+        df = self._fetch_balance_sheet_by_report_em(ak_symbol)
+        if indicator not in df.columns:
+            raise ValueError(f"科目 '{indicator}' 不在资产负债表返回字段中")
+
+        report_dates = self._extract_report_date_strings(df)
+
+        period_values: Dict[str, Optional[float]] = {p: None for p in periods_valid}
+        for p in periods_valid:
+            mask = report_dates == p
+            if not mask.any():
+                continue
+            row = df.loc[mask].iloc[0]
+            period_values[p] = self._coerce_numeric(row.get(indicator))
+
+        industry_info = self.get_shenwan_industry(stock_code, stock_name)
+
+        return {
+            "code": stock_code,
+            "name": stock_name,
+            "market": market or ("上海" if str(stock_code).startswith("6") else "深圳"),
+            "industry": industry_info,
+            "indicator": indicator,
+            "period_values": period_values,
+        }
+
+    def query_balance_sheet_indicator(
+        self,
+        periods: Union[str, Sequence[str]],
+        indicator_name: str,
+        stock_filter: Optional[Union[str, Sequence[str]]] = None,
+        market: Optional[Union[str, Sequence[str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """批量查询资产负债表指定科目值。
+
+        Returns:
+            [{code,name,market,industry,indicator,period_values:{period:value}}]
+        """
+        periods_valid = self._validate_periods(periods)
+        subjects = self.get_balance_sheet_subjects()
+        indicator = self._resolve_balance_sheet_indicator(indicator_name, subjects)
+
+        stocks = self.get_stock_list()
+        if not stocks:
+            raise RuntimeError("无法获取股票列表")
+
+        filtered_stocks = self._filter_stock_list(stocks, stock_filter=stock_filter, market=market)
+
+        logger.info(
+            f"开始查询资产负债表指标 indicator={indicator} periods={periods_valid} "
+            f"stocks={len(filtered_stocks)}/{len(stocks)}"
+        )
+
+        results: List[Dict[str, Any]] = []
+        for s in filtered_stocks:
+            code = str(s.get("code", ""))
+            name = str(s.get("name", ""))
+            mkt = s.get("market")
+            try:
+                record = self._query_balance_sheet_indicator_single(
+                    stock_code=code,
+                    stock_name=name,
+                    market=mkt,
+                    periods=periods_valid,
+                    indicator=indicator,
+                )
+                results.append(record)
+            except Exception as e:
+                logger.warning(f"查询失败 {code} {name}: {e}")
+                results.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "market": mkt,
+                        "industry": self.industry_cache.get(code)
+                        or {
+                            "shenwan_level1": "",
+                            "shenwan_level2": "",
+                            "shenwan_level3": "",
+                            "industry": "",
+                            "source": "unknown",
+                        },
+                        "indicator": indicator,
+                        "period_values": {p: None for p in periods_valid},
+                        "error": str(e),
+                    }
+                )
+
+        return results
+
+    def search_real_estate_data(self, stock_code: str, stock_name: str) -> Dict:
+        """兼容旧逻辑：默认查询 2023/2024 年末的“非经营性房地产资产”。
+
+        历史版本中该字段是硬编码字段；当前实现复用通用资产负债表查询能力。
+        """
+        periods = ["2023-12-31", "2024-12-31"]
+
+        result = {
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+            "real_estate_2023": None,
+            "real_estate_2024": None,
+        }
+
+        try:
+            subjects = self.get_balance_sheet_subjects()
+            indicator = self._resolve_balance_sheet_indicator("非经营性房地产资产", subjects)
+            record = self._query_balance_sheet_indicator_single(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                market=None,
+                periods=periods,
+                indicator=indicator,
+            )
+
+            pv = record.get("period_values", {})
+            result["real_estate_2023"] = pv.get(periods[0])
+            result["real_estate_2024"] = pv.get(periods[1])
+
+            industry_info = record.get("industry") or self.get_shenwan_industry(stock_code, stock_name)
+            if isinstance(industry_info, dict):
+                result.update(industry_info)
         except Exception as e:
             logger.error(f"搜索股票 {stock_code} 数据失败: {e}")
-            
+            try:
+                result.update(self.get_shenwan_industry(stock_code, stock_name))
+            except Exception:
+                pass
+
         return result
     
     def _generate_mock_data(self, stock_code: str, year: str) -> float:
