@@ -498,7 +498,8 @@ class RealEstateQueryApp(QMainWindow):
 
 
 def main():
-    """主函数"""
+    """主函数（供直接调用）"""
+    # 创建QApplication（如果在其他地方没有创建的话）
     app = QApplication(sys.argv)
     
     # 设置应用程序信息
