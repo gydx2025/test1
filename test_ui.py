@@ -135,62 +135,64 @@ def create_sample_data():
         print(f"插入数据失败: {e}")
     finally:
         conn.close()
+        service.close()
 
 def test_query_functions():
     """测试查询功能"""
     print("\n正在测试查询功能...")
     
     service = DataQueryService()
-    
-    # 测试1: 查询所有数据
-    print("\n=== 测试1: 查询所有数据 ===")
     try:
-        df = service.query_data()
-        print(f"查询结果: {len(df)} 条记录")
-        if not df.empty:
-            print("前5条记录:")
-            print(df.head())
-    except Exception as e:
-        print(f"查询失败: {e}")
-    
-    # 测试2: 按市场查询
-    print("\n=== 测试2: 按市场查询 ===")
-    try:
-        df = service.query_data(market='沪市')
-        print(f"沪市查询结果: {len(df)} 条记录")
-        if not df.empty:
-            print("前3条记录:")
-            print(df.head(3))
-    except Exception as e:
-        print(f"查询失败: {e}")
-    
-    # 测试3: 按股票代码查询
-    print("\n=== 测试3: 按股票代码查询 ===")
-    try:
-        df = service.query_data(stock_codes=['000001', '600519'])
-        print(f"特定股票查询结果: {len(df)} 条记录")
-        if not df.empty:
-            print(df)
-    except Exception as e:
-        print(f"查询失败: {e}")
-    
-    # 测试4: 按年份查询
-    print("\n=== 测试4: 按年份查询 ===")
-    try:
-        df = service.query_data(time_points=['2023'])
-        print(f"2023年查询结果: {len(df)} 条记录")
-        if not df.empty:
-            print("前3条记录:")
-            print(df.head(3))
-    except Exception as e:
-        print(f"查询失败: {e}")
+        # 测试1: 查询所有数据
+        print("\n=== 测试1: 查询所有数据 ===")
+        try:
+            df = service.query_data()
+            print(f"查询结果: {len(df)} 条记录")
+            if not df.empty:
+                print("前5条记录:")
+                print(df.head())
+        except Exception as e:
+            print(f"查询失败: {e}")
+        
+        # 测试2: 按市场查询
+        print("\n=== 测试2: 按市场查询 ===")
+        try:
+            df = service.query_data(market='沪市')
+            print(f"沪市查询结果: {len(df)} 条记录")
+            if not df.empty:
+                print("前3条记录:")
+                print(df.head(3))
+        except Exception as e:
+            print(f"查询失败: {e}")
+        
+        # 测试3: 按股票代码查询
+        print("\n=== 测试3: 按股票代码查询 ===")
+        try:
+            df = service.query_data(stock_codes=['000001', '600519'])
+            print(f"特定股票查询结果: {len(df)} 条记录")
+            if not df.empty:
+                print(df)
+        except Exception as e:
+            print(f"查询失败: {e}")
+        
+        # 测试4: 按年份查询
+        print("\n=== 测试4: 按年份查询 ===")
+        try:
+            df = service.query_data(time_points=['2023'])
+            print(f"2023年查询结果: {len(df)} 条记录")
+            if not df.empty:
+                print("前3条记录:")
+                print(df.head(3))
+        except Exception as e:
+            print(f"查询失败: {e}")
+    finally:
+        service.close()
 
 def test_export_function():
     """测试导出功能"""
     print("\n正在测试导出功能...")
     
     service = DataQueryService()
-    
     try:
         # 查询一些数据
         df = service.query_data()
@@ -218,18 +220,22 @@ def test_export_function():
             
     except Exception as e:
         print(f"导出测试失败: {e}")
+    finally:
+        service.close()
 
 def test_subjects_and_markets():
     """测试科目和市场数据"""
     print("\n正在测试科目和市场数据...")
     
     service = DataQueryService()
-    
-    print("可用财务指标:")
-    for i, subject in enumerate(service.available_subjects, 1):
-        print(f"{i:2d}. {subject['name']} ({subject['code']})")
-    
-    print(f"\n可用市场: {service.markets}")
+    try:
+        print("可用财务指标:")
+        for i, subject in enumerate(service.available_subjects, 1):
+            print(f"{i:2d}. {subject['name']} ({subject['code']})")
+        
+        print(f"\n可用市场: {service.markets}")
+    finally:
+        service.close()
 
 def main():
     """主测试函数"""

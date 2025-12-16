@@ -11,6 +11,7 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 import os
 import re
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,39 @@ class DataQueryService:
             db_path: 数据库路径
         """
         self.db_path = db_path
+        self._connection = None
         self.available_subjects = self._load_available_subjects()
         self.markets = ['全部', '沪市', '深市', '北市']
+    
+    @contextmanager
+    def _get_connection_context(self):
+        """获取数据库连接上下文管理器"""
+        conn = self._get_connection()
+        try:
+            yield conn
+        finally:
+            if conn:
+                conn.close()
+    
+    def _ensure_connection(self):
+        """确保数据库连接"""
+        if self._connection is None:
+            self._connection = self._get_connection()
+        return self._connection
+    
+    def close(self):
+        """关闭数据库连接"""
+        if self._connection:
+            try:
+                self._connection.close()
+            except Exception as e:
+                logger.error(f"关闭数据库连接失败: {str(e)}")
+            finally:
+                self._connection = None
+    
+    def __del__(self):
+        """析构函数，确保资源释放"""
+        self.close()
     
     def _load_available_subjects(self) -> List[Dict]:
         """
@@ -147,8 +179,9 @@ class DataQueryService:
             
             sql += " ORDER BY s.code, fd.year"
             
-            # 执行查询
-            df = pd.read_sql_query(sql, self._get_connection(), params=params)
+            # 执行查询，使用连接上下文管理器
+            with self._get_connection_context() as conn:
+                df = pd.read_sql_query(sql, conn, params=params)
             
             logger.info(f"查询完成，返回 {len(df)} 条记录")
             return df
@@ -170,7 +203,8 @@ class DataQueryService:
                 FROM stocks 
                 ORDER BY code
             """
-            df = pd.read_sql_query(sql, self._get_connection())
+            with self._get_connection_context() as conn:
+                df = pd.read_sql_query(sql, conn)
             return df
         except Exception as e:
             logger.error(f"获取股票列表失败: {str(e)}")

@@ -6,9 +6,16 @@ PyQt5A股非经营性房地产资产查询界面
 
 import sys
 import os
+import logging
 from typing import List, Dict
 from datetime import datetime
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # PyQt5导入
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -17,7 +24,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QMessageBox, QFileDialog, QDateEdit, QGroupBox,
                             QFormLayout, QHeaderView, QSplitter)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDate
-from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtGui import QFont, QIcon, QStandardItemModel, QStandardItem
 
 # 导入数据查询服务
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -113,11 +120,28 @@ class RealEstateQueryApp(QMainWindow):
     def __init__(self):
         """初始化主界面"""
         super().__init__()
-        self.query_service = DataQueryService()
-        self.query_worker = None
-        self.current_data = pd.DataFrame()
-        self.init_ui()
-        self.setup_connections()
+        logger.info("开始初始化主界面...")
+        
+        try:
+            logger.info("正在初始化数据查询服务...")
+            self.query_service = DataQueryService()
+            logger.info("数据查询服务初始化完成")
+            
+            self.query_worker = None
+            self.current_data = pd.DataFrame()
+            
+            logger.info("正在初始化UI...")
+            self.init_ui()
+            logger.info("UI初始化完成")
+            
+            logger.info("正在设置信号连接...")
+            self.setup_connections()
+            logger.info("信号连接完成")
+            
+            logger.info("主界面初始化成功")
+        except Exception as e:
+            logger.error(f"初始化失败: {str(e)}", exc_info=True)
+            raise
         
     def init_ui(self):
         """初始化用户界面"""
@@ -406,16 +430,18 @@ class RealEstateQueryApp(QMainWindow):
             return
         
         # 创建数据模型
-        from PyQt5.QtGui import QStandardItemModel, QStandardItem
-        
         model = QStandardItemModel()
         
         # 设置列标题
         headers = list(df.columns)
         model.setHorizontalHeaderLabels(headers)
         
+        # 为了避免内存问题，限制显示行数（显示前5000行）
+        display_limit = 5000
+        display_df = df.head(display_limit)
+        
         # 添加数据行
-        for row_idx, row in df.iterrows():
+        for row_idx, row in display_df.iterrows():
             row_items = []
             for col_idx, value in enumerate(row):
                 item = QStandardItem(str(value) if pd.notna(value) else "")
@@ -436,6 +462,10 @@ class RealEstateQueryApp(QMainWindow):
                 header.setSectionResizeMode(i, QHeaderView.Stretch)
             else:
                 header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        
+        # 如果有超过限制的数据，更新状态栏
+        if len(df) > display_limit:
+            self.statusBar().showMessage(f"显示前 {display_limit} 行，共 {len(df)} 条记录")
     
     def export_data(self):
         """导出数据"""
@@ -493,6 +523,10 @@ class RealEstateQueryApp(QMainWindow):
         if self.query_worker and self.query_worker.isRunning():
             self.query_worker.terminate()
             self.query_worker.wait()
+        
+        # 关闭数据库连接
+        if self.query_service:
+            self.query_service.close()
         
         event.accept()
 

@@ -6,22 +6,39 @@ A股非经营性房地产资产查询系统启动脚本
 
 import sys
 import os
+import logging
 
 # 添加项目根目录到路径
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 def main():
     """主函数"""
     try:
+        logger.info("开始启动A股非经营性房地产资产查询系统...")
+        
         # 尝试导入PyQt5 UI
+        logger.info("正在导入PyQt5...")
         from PyQt5.QtWidgets import QApplication
+        logger.info("PyQt5导入成功")
+        
+        logger.info("正在导入UI模块...")
         from ui.real_estate_query_app import RealEstateQueryApp
+        logger.info("UI模块导入成功")
         
         print("正在启动A股非经营性房地产资产查询系统...")
         
         # 创建QApplication
+        logger.info("创建QApplication...")
         app = QApplication(sys.argv)
+        logger.info("QApplication创建成功")
         
         # 设置应用程序信息
         app.setApplicationName("A股非经营性房地产资产查询系统")
@@ -29,8 +46,13 @@ def main():
         app.setOrganizationName("DataQuery System")
         
         # 创建主窗口
+        logger.info("创建主窗口...")
         window = RealEstateQueryApp()
+        logger.info("主窗口创建成功")
+        
+        logger.info("显示主窗口...")
         window.show()
+        logger.info("主窗口显示成功")
         
         print("UI启动成功！")
         print("使用说明:")
@@ -41,6 +63,7 @@ def main():
         print("5. 查询完成后可导出Excel")
         
         # 启动事件循环
+        logger.info("进入事件循环...")
         sys.exit(app.exec_())
         
     except ImportError as e:
@@ -55,6 +78,7 @@ def main():
         run_command_line_mode()
         
     except Exception as e:
+        logger.error(f"启动失败: {e}", exc_info=True)
         print(f"启动失败: {e}")
         sys.exit(1)
 
