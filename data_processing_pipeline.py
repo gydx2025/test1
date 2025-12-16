@@ -13,7 +13,7 @@ from datetime import datetime
 import time
 
 from data_validator import DataValidator, DataCleaner, DataDeduplication
-from local_storage import LocalDatabase, CacheManager, CSVBackupManager
+from local_storage import LocalDatabase, CacheManager, CSVBackupManager, write_to_local_cache
 from quality_monitor import DataQualityScore, DataQualityMonitor
 from checkpoint_manager import CheckpointManager, IncrementalUpdate, VersionManager
 from excel_exporter import ExcelReportGenerator
@@ -271,6 +271,9 @@ class DataProcessingPipeline:
                 'notes': '完整版本'
             }
             self.local_database.save_version_info(version, version_info)
+
+            # 写入本地缓存层（供快速查询/前缀搜索使用）
+            write_to_local_cache(stocks=stocks, industries=industries, version=version)
             
             logger.info(f"数据已保存到本地存储")
             

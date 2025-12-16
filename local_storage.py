@@ -12,7 +12,7 @@ import logging
 import os
 import csv
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -468,3 +468,40 @@ class CSVBackupManager:
         except Exception as e:
             logger.error(f"CSV恢复失败: {e}")
             return []
+
+
+def write_to_local_cache(
+    stocks: List[Dict],
+    industries: Dict[str, Dict],
+    version: str,
+) -> None:
+    """Write validated stocks/industries into the local_cache layer.
+
+    This is a thin integration wrapper so existing pipelines depending on
+    local_storage can persist cache snapshots without knowing the underlying
+    implementation.
+    """
+
+    try:
+        from config import LOCAL_CACHE_CONFIG
+        if not LOCAL_CACHE_CONFIG.get('enabled', True):
+            return
+
+        from local_cache.cache_store import build_local_cache_config
+        from local_cache import StockCacheStore, IndustryCacheStore
+
+        cfg = build_local_cache_config(LOCAL_CACHE_CONFIG)
+        stock_store = StockCacheStore(cfg)
+        industry_store = IndustryCacheStore(cfg)
+
+        cache_version = LOCAL_CACHE_CONFIG.get('default_version') or version
+        backup_ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+
+        stock_store.save(stocks, version=cache_version, create_backup=True, backup_timestamp=backup_ts)
+        industry_store.save(industries, version=cache_version, create_backup=False)
+
+        logger.info(
+            f"本地缓存层写入完成: stocks={len(stocks)}, industries={len(industries)}"
+        )
+    except Exception as e:
+        logger.warning(f"写入本地缓存层失败: {e}")

@@ -35,7 +35,7 @@ import re
 import random
 import pickle
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
 import warnings
@@ -46,11 +46,14 @@ from config import (
     DATA_SOURCES, REQUEST_CONFIG, USER_AGENT_POOL,
     HEADERS_CONFIG, PROXY_CONFIG, OUTPUT_CONFIG,
     DATA_CLEANING_CONFIG, LOGGING_CONFIG, INDUSTRY_SOURCES,
-    INDUSTRY_CACHE_CONFIG,
+    INDUSTRY_CACHE_CONFIG, LOCAL_CACHE_CONFIG,
 )
 
 from industry_classification_fetcher import IndustryClassificationFetcher
 from industry_classification_complete_getter import IndustryClassificationCompleteGetter
+
+from local_cache import IndustryCacheStore, StockCacheStore
+from local_cache.cache_store import build_local_cache_config
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -79,9 +82,27 @@ class AStockRealEstateDataCollector:
         self.company_data = []
         self.data_2023 = []
         self.data_2024 = []
-        
-        # 行业分类缓存
-        self.industry_cache = {}
+
+        # 本地缓存层（SQLite + pickle），用于快速启动/前缀查询
+        self.local_cache_enabled = bool(LOCAL_CACHE_CONFIG.get('enabled', True))
+        self.stock_cache_store = None
+        self.industry_cache_store = None
+        if self.local_cache_enabled:
+            try:
+                cache_cfg = build_local_cache_config(LOCAL_CACHE_CONFIG)
+                self.stock_cache_store = StockCacheStore(cache_cfg)
+                self.industry_cache_store = IndustryCacheStore(cache_cfg)
+            except Exception as e:
+                logger.warning(f"初始化本地缓存层失败，将退化为旧缓存机制: {e}")
+                self.local_cache_enabled = False
+
+        # 用于确保单次运行内仅创建一次缓存备份
+        self._local_cache_backup_timestamp: Optional[str] = None
+        self._local_cache_backup_done: bool = False
+        self._local_cache_dirty: bool = False
+
+        # 行业分类缓存（优先使用本地缓存层，其次使用旧的pkl缓存）
+        self.industry_cache: Dict[str, Dict] = {}
         self._load_industry_cache()
 
         self.industry_fetcher = IndustryClassificationFetcher(
@@ -96,7 +117,8 @@ class AStockRealEstateDataCollector:
         logger.info(f"User-Agent池大小: {len(USER_AGENT_POOL)}")
         logger.info(f"请求延迟范围: {REQUEST_CONFIG['delay_between_requests']}")
         logger.info(f"最大重试次数: {REQUEST_CONFIG['max_retries']}")
-        logger.info(f"行业分类缓存已启用: {INDUSTRY_CACHE_CONFIG.get('enabled')}")
+        logger.info(f"本地缓存层已启用: {self.local_cache_enabled}")
+        logger.info(f"行业分类旧缓存已启用: {INDUSTRY_CACHE_CONFIG.get('enabled')}")
     
     def _update_headers(self, referer: str = None):
         """更新请求头，轮换User-Agent"""
@@ -291,6 +313,21 @@ class AStockRealEstateDataCollector:
         4. 东方财富API
         5. 其他备用方案
         """
+
+        # 优先从本地缓存层读取（避免网络调用）
+        if self.local_cache_enabled and self.stock_cache_store:
+            try:
+                cached_stocks = self.stock_cache_store.load(force=False)
+                if cached_stocks:
+                    logger.info(f"✅ 股票列表已从本地缓存加载: {len(cached_stocks)}只")
+                    # 兼容下游逻辑：补齐industry字段
+                    return [
+                        {**s, 'industry': s.get('industry') or '未知'}
+                        for s in cached_stocks
+                    ]
+            except Exception as e:
+                logger.debug(f"读取股票本地缓存失败，将走网络获取: {e}")
+
         try:
             logger.info("="*80)
             logger.info("🚀 开始获取A股股票完整列表 - 多数据源补全机制")
@@ -358,6 +395,9 @@ class AStockRealEstateDataCollector:
                 
                 # 验证和统计股票列表
                 self._validate_and_report_stock_list(stock_list)
+
+                # 写入本地缓存层（用于后续前缀查询/快速启动）
+                self._save_stock_cache(stock_list)
             else:
                 logger.warning("⚠️ 所有数据源都无法获取股票列表，将使用模拟数据进行演示")
                 stock_list = self._generate_demo_stock_list()
@@ -1121,52 +1161,118 @@ class AStockRealEstateDataCollector:
         return demo_stocks
     
     def _load_industry_cache(self):
-        """从缓存文件加载行业分类映射"""
+        """加载行业分类缓存。
+
+        优先级：
+        1) local_cache/industries.*（SQLite + pickle，带TTL/版本管理）
+        2) 旧版 cache/industry/shenwan_industry_mapping.pkl（兼容历史路径）
+        """
         try:
+            if self.local_cache_enabled and self.industry_cache_store:
+                mapping = self.industry_cache_store.as_fetcher_cache_mapping()
+                if mapping:
+                    self.industry_cache.clear()
+                    self.industry_cache.update(mapping)
+                    logger.info(
+                        f"✅ 本地缓存层行业分类已加载，包含 {len(self.industry_cache)} 个股票的分类信息"
+                    )
+                    return
+
             if not INDUSTRY_CACHE_CONFIG.get('enabled'):
                 return
-            
+
             cache_dir = INDUSTRY_CACHE_CONFIG.get('cache_dir', './cache/industry')
             cache_file = os.path.join(cache_dir, INDUSTRY_CACHE_CONFIG.get('cache_file', 'shenwan_industry_mapping.pkl'))
-            
+
             if os.path.exists(cache_file):
                 with open(cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
                     if isinstance(cached_data, dict) and 'mapping' in cached_data:
-                        # 检查缓存是否过期
                         cache_time = cached_data.get('timestamp', 0)
                         cache_duration = INDUSTRY_CACHE_CONFIG.get('cache_duration', 7 * 24 * 3600)
                         if time.time() - cache_time < cache_duration:
-                            self.industry_cache = cached_data.get('mapping', {})
-                            logger.info(f"✅ 行业分类缓存已加载，包含 {len(self.industry_cache)} 个股票的分类信息")
+                            self.industry_cache.clear()
+                            self.industry_cache.update(cached_data.get('mapping', {}))
+                            logger.info(
+                                f"✅ 行业分类旧缓存已加载，包含 {len(self.industry_cache)} 个股票的分类信息"
+                            )
                             return
                         else:
-                            logger.info("⚠️ 行业分类缓存已过期，将重新获取")
+                            logger.info("⚠️ 行业分类旧缓存已过期，将重新获取")
                             os.remove(cache_file)
         except Exception as e:
             logger.warning(f"加载行业分类缓存失败: {e}")
     
     def _save_industry_cache(self):
-        """保存行业分类映射到缓存文件"""
+        """保存行业分类映射到缓存文件。
+
+        优先保存到 local_cache（SQLite + pickle），并兼容写回旧版pkl缓存。
+        """
         try:
-            if not INDUSTRY_CACHE_CONFIG.get('enabled') or not self.industry_cache:
+            if not self.industry_cache:
                 return
-            
+
+            if not self._local_cache_dirty:
+                return
+
+            # 1) 新本地缓存层
+            if self.local_cache_enabled and self.industry_cache_store:
+                if not self._local_cache_backup_timestamp:
+                    self._local_cache_backup_timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+
+                create_backup = not self._local_cache_backup_done
+                self.industry_cache_store.save(
+                    self.industry_cache,
+                    version=LOCAL_CACHE_CONFIG.get('default_version'),
+                    create_backup=create_backup,
+                    backup_timestamp=self._local_cache_backup_timestamp,
+                )
+                self._local_cache_backup_done = True
+
+            # 2) 旧版缓存（保持历史兼容性）
+            if not INDUSTRY_CACHE_CONFIG.get('enabled'):
+                self._local_cache_dirty = False
+                return
+
             cache_dir = INDUSTRY_CACHE_CONFIG.get('cache_dir', './cache/industry')
             os.makedirs(cache_dir, exist_ok=True)
-            
+
             cache_file = os.path.join(cache_dir, INDUSTRY_CACHE_CONFIG.get('cache_file', 'shenwan_industry_mapping.pkl'))
-            
+
             cache_data = {
                 'timestamp': time.time(),
                 'mapping': self.industry_cache
             }
-            
+
             with open(cache_file, 'wb') as f:
                 pickle.dump(cache_data, f)
-            logger.debug(f"行业分类缓存已保存: {cache_file}")
+            logger.debug(f"行业分类旧缓存已保存: {cache_file}")
+
+            self._local_cache_dirty = False
         except Exception as e:
             logger.warning(f"保存行业分类缓存失败: {e}")
+
+    def _save_stock_cache(self, stocks: List[Dict]):
+        """保存股票列表到本地缓存层（local_cache）。"""
+        try:
+            if not stocks:
+                return
+            if not (self.local_cache_enabled and self.stock_cache_store):
+                return
+
+            if not self._local_cache_backup_timestamp:
+                self._local_cache_backup_timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+
+            create_backup = not self._local_cache_backup_done
+            self.stock_cache_store.save(
+                stocks,
+                version=LOCAL_CACHE_CONFIG.get('default_version'),
+                create_backup=create_backup,
+                backup_timestamp=self._local_cache_backup_timestamp,
+            )
+            self._local_cache_backup_done = True
+        except Exception as e:
+            logger.warning(f"保存股票缓存失败: {e}")
     
     def _get_shenwan_industry_from_tushare(self, stock_code: str) -> Optional[Dict]:
         """从tushare获取申万行业分类"""
@@ -1308,7 +1414,17 @@ class AStockRealEstateDataCollector:
     def get_shenwan_industry(self, stock_code: str, stock_name: str) -> Dict:
         """获取申万行业分类（多数据源 + 智能补全 + 缓存）。"""
         try:
-            return self.industry_fetcher.get_industry(stock_code, stock_name, "")
+            before = self.industry_cache.get(stock_code)
+            before_valid = bool(before and self.industry_fetcher.is_cache_entry_valid(before))
+
+            result = self.industry_fetcher.get_industry(stock_code, stock_name, "")
+
+            after = self.industry_cache.get(stock_code)
+            after_valid = bool(after and self.industry_fetcher.is_cache_entry_valid(after))
+            if after_valid and not before_valid:
+                self._local_cache_dirty = True
+
+            return result
         except Exception as e:
             logger.error(f"获取{stock_code}行业分类过程出错: {e}")
             return {
@@ -1670,28 +1786,72 @@ class AStockRealEstateDataCollector:
             print("🏷️ 第2步：多源循环补全申万行业分类")
             print("="*60)
             try:
-                # 使用新的多源循环补全获取器
-                complete_getter = IndustryClassificationCompleteGetter(logger=logger)
-                industries = complete_getter.get_complete_classification(stock_list, show_progress=True)
-                
-                # 将结果转换为旧格式以兼容现有代码
-                industries_dict = {code: data for code, data in industries.items()}
+                # 先用缓存命中（避免网络调用）
+                cached_for_run: Dict[str, Dict] = {}
+                for s in stock_list:
+                    code = s.get('code')
+                    if not code:
+                        continue
+                    cached = self.industry_cache.get(code)
+                    if cached and cached.get('source') not in {'unknown', 'error'}:
+                        cached_for_run[code] = cached
+
+                missing_stocks = [s for s in stock_list if s.get('code') and s.get('code') not in cached_for_run]
+
+                if cached_for_run:
+                    print(f"🗄️  已从缓存命中行业分类: {len(cached_for_run)}/{len(stock_list)}")
+
+                fetched: Dict[str, Dict] = {}
+                if missing_stocks:
+                    # 使用新的多源循环补全获取器，仅获取缺失部分
+                    complete_getter = IndustryClassificationCompleteGetter(logger=logger)
+                    fetched = complete_getter.get_complete_classification(missing_stocks, show_progress=True)
+
+                industries_dict: Dict[str, Dict] = {**cached_for_run, **(fetched or {})}
+
+                # 补齐未返回的股票
+                for s in stock_list:
+                    code = s.get('code')
+                    if code and code not in industries_dict:
+                        industries_dict[code] = {
+                            'shenwan_level1': '',
+                            'shenwan_level2': '',
+                            'shenwan_level3': '',
+                            'industry': '',
+                            'source': 'unknown',
+                        }
+
                 total = len(industries_dict)
                 success = len([v for v in industries_dict.values() if v.get('source') not in {'unknown', 'error'}])
-                
-                # 更新缓存
+
+                # 更新缓存（in-place，保持fetcher引用不变）
                 self.industry_cache.update(industries_dict)
-                self._save_industry_cache()
-                
-                print(f"✅ 多源循环补全完成：{success}/{total} 只股票获得有效分类")
+                if missing_stocks:
+                    self._local_cache_dirty = True
+                    self._save_industry_cache()
+
+                print(f"✅ 行业分类准备完成：{success}/{total} 只股票获得有效分类")
                 print(f"📊 覆盖率: {success/total*100:.1f}%")
-                
+
             except Exception as e:
                 logger.warning(f"多源循环补全行业分类失败，使用备用方案: {e}")
-                # 备用方案：使用旧的获取器
-                industries = self.industry_fetcher.batch_get_industries(stock_list)
-                total = len(industries)
-                success = len([v for v in industries.values() if v.get('source') not in {'unknown', 'error'}])
+                # 备用方案：使用旧的获取器（同样只处理缺失部分）
+                missing_stocks = [s for s in stock_list if s.get('code') and s.get('code') not in self.industry_cache]
+                fetched = self.industry_fetcher.batch_get_industries(missing_stocks)
+                industries_dict = {**self.industry_cache, **(fetched or {})}
+
+                total = len([s for s in stock_list if s.get('code')])
+                success = len([
+                    code for code in industries_dict
+                    if code in {s.get('code') for s in stock_list}
+                    and industries_dict.get(code, {}).get('source') not in {'unknown', 'error'}
+                ])
+
+                self.industry_cache.update(industries_dict)
+                if fetched:
+                    self._local_cache_dirty = True
+                    self._save_industry_cache()
+
                 print(f"✅ 备用方案完成：{success}/{total} 只股票获得有效分类")
 
             # 3. 逐个获取股票数据
