@@ -301,6 +301,88 @@ class AStockRealEstateDataCollector:
             return False
         
         return True
+
+    def query_balance_sheet_indicator(
+        self,
+        stock_code: str,
+        indicator: str,
+        report_dates,
+    ) -> Dict[str, Optional[float]]:
+        """查询单个股票在指定报表时点的资产负债表指标。
+
+        该方法作为前端查询入口的底层能力（服务层负责参数校验、去重、格式化等）。
+
+        Args:
+            stock_code: 6 位股票代码
+            indicator: AkShare 东财资产负债表字段名（如 INVEST_REALESTATE）
+            report_dates: str 或 list[str]，例如 2024-03-31
+
+        Returns:
+            dict: {"YYYY-MM-DD": value_or_None}
+        """
+
+        if isinstance(report_dates, str):
+            report_dates = [report_dates]
+
+        # 统一时点字符串
+        norm_dates: List[str] = []
+        for d in report_dates:
+            if d is None:
+                continue
+            ds = str(d).strip()
+            if not ds:
+                continue
+            norm_dates.append(ds.split(" ")[0].replace("/", "-"))
+
+        result: Dict[str, Optional[float]] = {d: None for d in norm_dates}
+
+        if not norm_dates:
+            return result
+
+        if not self.validate_stock_code(stock_code):
+            raise ValueError(f"无效股票代码: {stock_code}")
+
+        # AkShare 资产负债表接口使用 SH600519 / SZ000001 / BJ430047 这样的 symbol
+        prefix = "SZ"
+        if stock_code.startswith("6"):
+            prefix = "SH"
+        elif stock_code.startswith(("0", "3")):
+            prefix = "SZ"
+        elif stock_code.startswith(("4", "8")):
+            prefix = "BJ"
+        symbol = f"{prefix}{stock_code}"
+
+        try:
+            import akshare as ak
+        except Exception as e:
+            raise RuntimeError(f"AkShare 导入失败: {e}")
+
+        df = ak.stock_balance_sheet_by_report_em(symbol)
+        if df is None or df.empty:
+            return result
+
+        # REPORT_DATE 的值形如 2024-03-31 00:00:00
+        if "REPORT_DATE" not in df.columns:
+            return result
+
+        col = str(indicator).upper().strip()
+        if col not in df.columns:
+            raise ValueError(f"指标字段不存在: {indicator}")
+
+        for d in norm_dates:
+            try:
+                mask = df["REPORT_DATE"].astype(str).str.startswith(d)
+                if not mask.any():
+                    continue
+                value = df.loc[mask, col].iloc[0]
+                try:
+                    result[d] = float(str(value).replace(",", "")) if value is not None else None
+                except Exception:
+                    result[d] = None
+            except Exception:
+                continue
+
+        return result
     
     def get_stock_list(self) -> List[Dict]:
         """
