@@ -153,6 +153,7 @@ class RealEstateQueryApp(QMainWindow):
         self.query_service = DataQueryService()
         self.query_worker = None
         self.current_data = pd.DataFrame()
+        self.last_query_params = {}  # 保存最后一次查询的参数
         self.init_ui()
         self.setup_connections()
         
@@ -582,10 +583,25 @@ class RealEstateQueryApp(QMainWindow):
             'subject_names': [subj['name'] for subj in self.selected_subjects]
         }
 
+        # 收集时点
+        report_dates = []
         for i, date_edit in enumerate(self.time_edits):
-            query_params[f'time_point_{i}'] = (
-                date_edit.date().toString('yyyy-MM-dd') if not self._is_time_edit_empty(date_edit) else None
-            )
+            date_str = date_edit.date().toString('yyyy-MM-dd') if not self._is_time_edit_empty(date_edit) else None
+            query_params[f'time_point_{i}'] = date_str
+            if date_str:
+                report_dates.append(date_str)
+        
+        # 保存查询参数用于导出
+        self.last_query_params = {
+            'subject_codes': query_params['subject_codes'],
+            'report_dates': report_dates,
+            'filters': {
+                'market': query_params['market'],
+                'industry': query_params['industry'],
+                'stock_codes': [c.strip() for c in query_params['stock_codes'].split(',') if c.strip()],
+                'stock_names': [n.strip() for n in query_params['stock_names'].split(',') if n.strip()]
+            }
+        }
 
         self.execute_query(query_params)
     
@@ -738,9 +754,15 @@ class RealEstateQueryApp(QMainWindow):
         if not file_path:
             return
         
-        # 执行导出
+        # 执行导出，传递查询参数用于生成元数据Sheet
         try:
-            success = self.query_service.export_to_excel(self.current_data, file_path)
+            success = self.query_service.export_to_excel(
+                self.current_data, 
+                file_path,
+                subject_codes=self.last_query_params.get('subject_codes'),
+                report_dates=self.last_query_params.get('report_dates'),
+                filters=self.last_query_params.get('filters')
+            )
             
             if success:
                 QMessageBox.information(self, "成功", f"数据已成功导出到：\n{file_path}")

@@ -14,6 +14,17 @@ sys.path.insert(0, project_root)
 def main():
     """主函数"""
     try:
+        # 初始化缓存
+        from ui.data_query_service import DataQueryService
+        print("初始化缓存系统...")
+        query_service = DataQueryService()
+        cache_result = query_service.update_daily_cache()
+        
+        if cache_result.get('success'):
+            print(f"✓ 缓存系统就绪：{cache_result.get('stock_count', 0)} 只股票")
+        else:
+            print(f"⚠ 缓存初始化提示: {cache_result.get('message')}")
+        
         # 尝试导入PyQt5 UI
         from PyQt5.QtWidgets import QApplication
         from ui.real_estate_query_app import RealEstateQueryApp
@@ -32,8 +43,8 @@ def main():
         window = RealEstateQueryApp()
         window.show()
         
-        print("UI启动成功！")
-        print("使用说明:")
+        print("✓ UI启动成功！")
+        print("\n使用说明:")
         print("1. 选择财务指标或手动输入")
         print("2. 选择查询时点（最多4个）")
         print("3. 输入股票代码/名称进行筛选")
