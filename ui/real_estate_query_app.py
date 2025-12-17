@@ -171,10 +171,11 @@ class RealEstateQueryApp(QMainWindow):
         # 第一行：科目选择 + 时点选择
         row1_layout = QHBoxLayout()
 
-        # 科目选择
+        # 科目选择（多选，最多3个）
         subject_layout = QVBoxLayout()
-        subject_layout.addWidget(QLabel("资产负债表科目:"))
+        subject_layout.addWidget(QLabel("资产负债表科目 (最多选择3个):"))
 
+        # 创建多选科目下拉框
         self.subject_combo = QComboBox()
         self.subject_combo.addItem("-- 选择科目 --", None)
         for subject in self.query_service.available_subjects:
@@ -182,9 +183,18 @@ class RealEstateQueryApp(QMainWindow):
         self.subject_combo.currentIndexChanged.connect(self.on_subject_changed)
         subject_layout.addWidget(self.subject_combo)
 
-        self.subject_input = QLineEdit()
-        self.subject_input.setPlaceholderText("或手动输入科目名称...")
-        subject_layout.addWidget(self.subject_input)
+        # 已选择的科目显示
+        self.selected_subjects = []
+        self.selected_subjects_layout = QVBoxLayout()
+        self.subject_label = QLabel("已选择的科目:")
+        self.subject_label.setVisible(False)
+        self.selected_subjects_layout.addWidget(self.subject_label)
+        
+        self.selected_subjects_text = QLabel("")
+        self.selected_subjects_text.setVisible(False)
+        self.selected_subjects_layout.addWidget(self.selected_subjects_text)
+        
+        subject_layout.addLayout(self.selected_subjects_layout)
 
         row1_layout.addLayout(subject_layout)
         row1_layout.addStretch()
@@ -196,13 +206,15 @@ class RealEstateQueryApp(QMainWindow):
         time_points_layout = QHBoxLayout()
         self.time_edits = []
         empty_date = QDate(1900, 1, 1)
-        for _ in range(4):
+        for i in range(4):
             date_edit = QDateEdit()
             date_edit.setCalendarPopup(True)
             date_edit.setDisplayFormat("yyyy-MM-dd")
             date_edit.setMinimumDate(empty_date)
             date_edit.setSpecialValueText("留空")
             date_edit.setDate(empty_date)
+            # 添加日期变化监听
+            date_edit.dateChanged.connect(self.on_time_point_changed)
             self.time_edits.append(date_edit)
             time_points_layout.addWidget(date_edit)
 
@@ -339,9 +351,101 @@ class RealEstateQueryApp(QMainWindow):
         
     def on_subject_changed(self, index):
         """科目选择变化处理"""
-        # 如果选择了下拉框中的项目，清空手动输入框
-        if index > 0:
-            self.subject_input.clear()
+        if index == 0:  # 如果选择了"-- 选择科目 --"，不做任何处理
+            return
+        
+        selected_code = self.subject_combo.currentData()
+        selected_name = self.subject_combo.currentText()
+        
+        if not selected_code:
+            return
+            
+        # 检查是否已经选择了这个科目
+        if any(subj['code'] == selected_code for subj in self.selected_subjects):
+            QMessageBox.information(self, "提示", f"科目 '{selected_name}' 已经被选择")
+            return
+            
+        # 检查是否已达到最大选择数量（3个）
+        if len(self.selected_subjects) >= 3:
+            QMessageBox.warning(self, "警告", "最多只能选择3个科目")
+            return
+            
+        # 添加科目到已选择列表
+        self.selected_subjects.append({
+            'code': selected_code,
+            'name': selected_name
+        })
+        
+        # 更新已选择科目的显示
+        self._update_selected_subjects_display()
+        
+        # 重置下拉框到第一项
+        self.subject_combo.setCurrentIndex(0)
+    
+    def _update_selected_subjects_display(self):
+        """更新已选择科目的显示"""
+        if not self.selected_subjects:
+            self.subject_label.setVisible(False)
+            self.selected_subjects_text.setVisible(False)
+        else:
+            self.subject_label.setVisible(True)
+            self.selected_subjects_text.setVisible(True)
+            
+            # 显示已选择的科目
+            subject_names = [f"{i+1}. {subj['name']}" for i, subj in enumerate(self.selected_subjects)]
+            self.selected_subjects_text.setText("\n".join(subject_names))
+            
+            # 添加清除按钮
+            if not hasattr(self, 'clear_subjects_button'):
+                self.clear_subjects_button = QPushButton("清除已选科目")
+                self.clear_subjects_button.clicked.connect(self.clear_selected_subjects)
+                self.selected_subjects_layout.addWidget(self.clear_subjects_button)
+                
+            self.clear_subjects_button.setVisible(True)
+    
+    def clear_selected_subjects(self):
+        """清除所有已选择的科目"""
+        self.selected_subjects.clear()
+        self._update_selected_subjects_display()
+        if hasattr(self, 'clear_subjects_button'):
+            self.clear_subjects_button.setVisible(False)
+    
+    def on_time_point_changed(self):
+        """财报期变化处理 - 实时更新状态栏显示"""
+        selected_dates = self._collect_selected_report_dates()
+        if selected_dates:
+            dates_str = ", ".join(selected_dates)
+            self.statusBar().showMessage(f"已选择时点: {dates_str}")
+        else:
+            self.statusBar().showMessage("就绪 - 请选择财报期")
+            
+    def reset_form(self):
+        """重置表单"""
+        # 重置输入框
+        self.stock_code_input.clear()
+        self.stock_name_input.clear()
+        
+        # 重置下拉框
+        self.market_combo.setCurrentIndex(0)
+        self.industry_combo.setCurrentIndex(0)
+        
+        # 重置时点选择
+        empty_date = QDate(1900, 1, 1)
+        for date_edit in self.time_edits:
+            date_edit.setDate(empty_date)
+            
+        # 清除已选择的科目
+        self.clear_selected_subjects()
+        
+        # 重置状态栏
+        self.statusBar().showMessage("表单已重置")
+        
+        # 清空表格数据
+        from PyQt5.QtGui import QStandardItemModel
+        self.result_table.setModel(QStandardItemModel())
+        
+        # 禁用导出按钮
+        self.export_button.setEnabled(False)
 
     @staticmethod
     def _is_time_edit_empty(date_edit: QDateEdit) -> bool:
@@ -452,9 +556,13 @@ class RealEstateQueryApp(QMainWindow):
 
     def validate_input(self) -> bool:
         """验证输入参数"""
-        selected_dates = self._collect_selected_report_dates()
-
+        # 检查是否选择了科目
+        if not self.selected_subjects:
+            QMessageBox.warning(self, "警告", "请至少选择一个科目")
+            return False
+            
         # 检查是否有至少一个时点
+        selected_dates = self._collect_selected_report_dates()
         if not selected_dates:
             reply = QMessageBox.question(
                 self, "确认", "未选择时点，将查询所有可用数据，是否继续？",
@@ -475,7 +583,8 @@ class RealEstateQueryApp(QMainWindow):
             'stock_names': self.stock_name_input.text(),
             'market': self.market_combo.currentText(),
             'industry': self.industry_combo.currentText(),
-            'subject_code': self.subject_combo.currentData()
+            'subject_codes': [subj['code'] for subj in self.selected_subjects],
+            'subject_names': [subj['name'] for subj in self.selected_subjects]
         }
 
         for i, date_edit in enumerate(self.time_edits):
