@@ -200,7 +200,10 @@ class DataQueryService:
             raise
     
     def _query_from_collector(self, stock_codes: List[str], subject_codes: List[str], time_points: List[str]) -> pd.DataFrame:
-        """使用原有采集器逻辑查询数据（主要查询方法）"""
+        """使用原有采集器逻辑查询数据（主要查询方法）
+        
+        核心逻辑改进：使用宽表格式（每行一个股票），而不是长表格式（每个科目一行）
+        """
         try:
             logger.info(f"开始使用采集器逻辑查询: {len(subject_codes)}个科目, {len(stock_codes)}只股票, {len(time_points)}个时点")
             
@@ -210,44 +213,70 @@ class DataQueryService:
             
             # 创建查询服务
             query_service = FinancialQueryService()
+            collector = AStockRealEstateDataCollector()
             
-            # 获取股票基础信息（代码、名称、市场）
-            # 这里我们需要通过采集器获取股票信息
+            # 第一步：获取股票基础信息（代码、名称、市场、上市时间）
+            logger.info("第一步：获取股票基础信息...")
+            stock_info_map = {}
             try:
-                collector = AStockRealEstateDataCollector()
                 stock_info_list = collector.get_stock_list()
                 
-                # 构建股票代码到股票信息的映射
-                stock_info_map = {}
                 for stock_info in stock_info_list:
                     code = stock_info.get('code', '')
+                    if not code:
+                        continue
+                    
+                    market = stock_info.get('market', '')
+                    market_display = self._get_market_display_name(market)
+                    
+                    # 从股票代码推断市场（如果采集器返回的市场信息不可用）
+                    if not market or market_display == '未知市场':
+                        market_display = self._infer_market_from_code(code)
+                    
                     stock_info_map[code] = {
                         '股票代码': code,
                         '股票名称': stock_info.get('name', ''),
-                        '市场': self._get_market_display_name(stock_info.get('market', ''))
+                        '市场': market_display,
+                        '上市时间': stock_info.get('list_date', '') or stock_info.get('listDate', '')
                     }
                 
                 logger.info(f"获取了 {len(stock_info_map)} 只股票的基础信息")
             except Exception as e:
                 logger.warning(f"获取股票基础信息失败: {e}")
                 # 创建基本的股票信息映射
-                stock_info_map = {}
                 for code in stock_codes:
                     stock_info_map[code] = {
                         '股票代码': code,
-                        '股票名称': code,  # 临时使用代码作为名称
-                        '市场': self._get_market_display_name(code)
+                        '股票名称': code,
+                        '市场': self._infer_market_from_code(code),
+                        '上市时间': ''
                     }
                 logger.info(f"使用默认股票信息映射: {len(stock_info_map)} 只股票")
             
-            all_results = []
+            # 第二步：为了查询的股票代码，创建基础行（每只股票一行）
+            logger.info("第二步：创建基础行（每只股票一行）...")
+            base_rows = []
+            for code in stock_codes:
+                if code in stock_info_map:
+                    base_rows.append(stock_info_map[code].copy())
+                else:
+                    # 如果没有找到，创建一个基本的行
+                    base_rows.append({
+                        '股票代码': code,
+                        '股票名称': code,
+                        '市场': self._infer_market_from_code(code),
+                        '上市时间': ''
+                    })
             
-            # 为每个科目分别查询
+            result_df = pd.DataFrame(base_rows)
+            logger.info(f"创建了 {len(result_df)} 行基础数据")
+            
+            # 第三步：为每个科目查询数据，并merge到基础DataFrame中
+            logger.info("第三步：为每个科目查询数据...")
             for subject_code in subject_codes:
-                logger.info(f"查询科目: {subject_code}")
+                logger.info(f"  查询科目: {subject_code}")
                 
                 try:
-                    # 获取科目显示名称
                     subject_display_name = self._get_subject_display_name(subject_code)
                     
                     # 准备查询参数
@@ -257,7 +286,8 @@ class DataQueryService:
                         'subject': subject_display_name,
                         'report_dates': time_points,
                         'return_format': 'dataframe',
-                        'unit': '万元'
+                        'unit': '万元',
+                        'enrich_stock_info': False  # 不需要补充股票名称
                     }
                     
                     # 执行查询
@@ -265,69 +295,61 @@ class DataQueryService:
                     
                     if result.success and result.dataframe is not None:
                         df = result.dataframe.copy()
-                        logger.info(f"科目 {subject_code} 查询成功，返回 {len(df)} 条记录")
+                        logger.info(f"  科目 {subject_code} 查询成功，返回 {len(df)} 条记录")
                         
-                        # 为每个科目添加单独的列，格式：科目名称(时点)
-                        for _, row in df.iterrows():
-                            stock_code = row.get('stock_code', '')
-                            if stock_code and stock_code in stock_info_map:
-                                # 创建结果记录
-                                record = stock_info_map[stock_code].copy()
-                                
-                                # 添加各时点的数值
-                                for time_point in time_points:
-                                    col_name = f"{subject_display_name}({time_point})(万元)"
-                                    value = row.get(col_name)
-                                    record[col_name] = value
-                                
-                                all_results.append(record)
+                        # 创建科目数据的列映射：每个时点的数据作为单独的列
+                        # 例如：2024-12-31/投资性房地产(万元) 作为一个列名
+                        subject_data = df[['stock_code']].copy()
+                        subject_data.rename(columns={'stock_code': '股票代码'}, inplace=True)
+                        
+                        # 获取科目相关的数据列（排除基础列）
+                        base_cols = {'stock_code', 'stock_name', 'market'}
+                        for col in df.columns:
+                            if col not in base_cols:
+                                # 这是一个科目数据列，需要重命名为 科目(时点)(万元) 的格式
+                                subject_data[col] = df[col]
+                        
+                        # 以股票代码为key进行merge
+                        result_df = result_df.merge(subject_data, on='股票代码', how='left')
+                        logger.info(f"  成功merge科目数据，结果行数: {len(result_df)}")
                     else:
-                        logger.warning(f"科目 {subject_code} 查询失败: {result.error}")
-                        # 即使查询失败，也需要创建空记录以保持数据结构
-                        for code in stock_codes:
-                            if code in stock_info_map:
-                                record = stock_info_map[code].copy()
-                                for time_point in time_points:
-                                    col_name = f"{subject_display_name}({time_point})(万元)"
-                                    record[col_name] = None
-                                all_results.append(record)
+                        logger.warning(f"  科目 {subject_code} 查询失败: {result.error}")
+                        # 为这个科目添加空列
+                        for time_point in time_points:
+                            col_name = f"{time_point}/{subject_display_name}(万元)"
+                            result_df[col_name] = None
                 
                 except Exception as e:
-                    logger.error(f"查询科目 {subject_code} 时出错: {e}")
-                    # 创建错误记录
-                    for code in stock_codes:
-                        if code in stock_info_map:
-                            record = stock_info_map[code].copy()
-                            for time_point in time_points:
-                                col_name = f"{subject_display_name}({time_point})(万元)"
-                                record[col_name] = None
-                            all_results.append(record)
+                    logger.error(f"  查询科目 {subject_code} 时出错: {e}")
+                    # 为这个科目添加空列
+                    for time_point in time_points:
+                        col_name = f"{time_point}/{subject_display_name}(万元)"
+                        result_df[col_name] = None
             
-            # 如果没有结果，返回空DataFrame
-            if not all_results:
-                logger.warning("查询未返回任何数据")
-                return pd.DataFrame()
-            
-            # 合并所有结果
-            result_df = pd.DataFrame(all_results)
-            
-            # 按股票代码和时点重新组织列的顺序
+            # 第四步：组织列的顺序
+            logger.info("第四步：组织列的顺序...")
             if not result_df.empty:
-                # 确定列的顺序
-                base_columns = ['股票代码', '股票名称', '市场']
-                data_columns = []
+                # 基础列
+                base_columns = ['股票代码', '股票名称', '上市时间', '市场']
                 
-                # 获取所有数据列并排序
+                # 数据列（科目列）
+                data_columns = []
                 for col in result_df.columns:
                     if col not in base_columns:
                         data_columns.append(col)
                 
-                data_columns.sort()  # 按列名排序
+                # 对数据列进行排序（按时点，然后按科目）
+                data_columns.sort()
+                
+                # 最终列顺序
                 final_columns = base_columns + data_columns
                 
-                # 重新排列列
+                # 只保留实际存在的列
                 existing_columns = [col for col in final_columns if col in result_df.columns]
                 result_df = result_df[existing_columns]
+            
+            # 移除重复行（以防万一）
+            result_df = result_df.drop_duplicates(subset=['股票代码'], keep='first').reset_index(drop=True)
             
             logger.info(f"=== 采集器查询完成，共返回 {len(result_df)} 条记录 ===")
             return result_df
@@ -336,24 +358,76 @@ class DataQueryService:
             logger.error(f"使用采集器查询失败: {e}", exc_info=True)
             return pd.DataFrame()
     
+    def _infer_market_from_code(self, stock_code: str) -> str:
+        """根据股票代码推断市场
+        
+        规则：
+        - 600xxx, 601xxx, 603xxx → 沪市
+        - 000xxx, 001xxx, 003xxx → 深市
+        - 688xxx → 沪市科创板
+        - 830xxx, 833xxx, 835xxx, 837xxx, 839xxx, 873xxx, 874xxx, 875xxx, 876xxx, 880xxx, 886xxx, 900xxx → 北交所
+        - 200xxx → 深市
+        """
+        if not stock_code:
+            return '未知市场'
+        
+        code_str = str(stock_code).strip()
+        if not code_str:
+            return '未知市场'
+        
+        first_digit = code_str[0]
+        first_three = code_str[:3]
+        
+        # 沪市
+        if first_three in ('600', '601', '603', '688'):
+            return '沪市'
+        
+        # 深市
+        if first_digit == '0' or first_three in ('200',):
+            return '深市'
+        
+        # 北交所
+        if first_digit in ('4', '8', '9'):
+            # 更细致的检查
+            if code_str.startswith(('830', '833', '835', '837', '839', '873', '874', '875', '876', '880', '886', '900')):
+                return '北交所'
+        
+        return '未知市场'
+    
     def _get_market_display_name(self, market_code: str) -> str:
         """根据市场代码获取显示名称"""
+        if not market_code:
+            return '未知市场'
+        
+        market_str = str(market_code).strip().upper()
+        
+        # 如果已经是中文显示名称，直接返回
+        if market_str in ('沪市', '深市', '北市', '北交所'):
+            return market_str
+        
         market_map = {
             'SH': '沪市',
+            'SHA': '沪市',
+            'SHANGHAI': '沪市',
             'SZ': '深市', 
+            'SZE': '深市',
+            'SHENZHEN': '深市',
             'BJ': '北市',
+            'BJS': '北交所',
+            'BEIJING': '北交所',
             '6': '沪市',
             '0': '深市',
             '3': '深市',
-            '4': '北市',
-            '8': '北市'
+            '4': '北交所',
+            '8': '北交所',
+            '9': '北交所'
         }
         
         # 提取市场前缀
-        if market_code.startswith(('SH', 'SZ', 'BJ')):
-            code_prefix = market_code[:2]
+        if market_str.startswith(('SH', 'SZ', 'BJ')):
+            code_prefix = market_str[:2]
         else:
-            code_prefix = market_code[0] if market_code else '0'
+            code_prefix = market_str[0] if market_str else '0'
         
         return market_map.get(code_prefix, '未知市场')
     
@@ -409,7 +483,7 @@ class DataQueryService:
         """获取股票列表。
 
         Returns:
-            股票列表DataFrame（包含股票代码、股票名称、市场字段）
+            股票列表DataFrame（包含股票代码、股票名称、市场字段、上市时间）
         """
         try:
             logger.info("获取股票列表（使用采集器逻辑）...")
@@ -429,10 +503,26 @@ class DataQueryService:
                     df = df.rename(columns={'code': '股票代码'})
                 if 'name' in df.columns:
                     df = df.rename(columns={'name': '股票名称'})
+                
+                # 处理市场信息
                 if 'market' in df.columns:
                     # 将市场代码转换为显示名称
                     df['市场'] = df['market'].apply(self._get_market_display_name)
                     df = df.drop('market', axis=1)
+                else:
+                    # 如果没有market列，从股票代码推断
+                    if '股票代码' in df.columns:
+                        df['市场'] = df['股票代码'].apply(self._infer_market_from_code)
+                    else:
+                        df['市场'] = '未知市场'
+                
+                # 处理上市时间
+                list_date_col = None
+                for col in ('list_date', 'listDate', 'ipo_date', 'ipoDate', '上市时间'):
+                    if col in df.columns:
+                        list_date_col = col
+                        df = df.rename(columns={col: '上市时间'})
+                        break
                 
                 # 确保有基本的列
                 if '股票代码' not in df.columns:
@@ -441,20 +531,28 @@ class DataQueryService:
                     df['股票名称'] = ''
                 if '市场' not in df.columns:
                     df['市场'] = '未知市场'
+                if '上市时间' not in df.columns:
+                    df['上市时间'] = ''
+                
+                # 修复市场信息：如果是"未知市场"，从代码推断
+                if df['市场'].eq('未知市场').any():
+                    mask = df['市场'] == '未知市场'
+                    df.loc[mask, '市场'] = df.loc[mask, '股票代码'].apply(self._infer_market_from_code)
                 
                 # 按股票代码排序
                 df = df.sort_values('股票代码').reset_index(drop=True)
                 
                 logger.info(f"成功获取 {len(df)} 只股票")
+                logger.info(f"市场分布: {df['市场'].value_counts().to_dict()}")
                 return df
             else:
                 logger.warning("采集器返回空股票列表")
                 return pd.DataFrame()
                 
         except Exception as e:
-            logger.error(f"获取股票列表失败: {str(e)}")
+            logger.error(f"获取股票列表失败: {str(e)}", exc_info=True)
             # 如果采集器失败，返回基本的DataFrame结构
-            return pd.DataFrame(columns=['股票代码', '股票名称', '市场'])
+            return pd.DataFrame(columns=['股票代码', '股票名称', '市场', '上市时间'])
 
     def get_industry_options(self) -> List[str]:
         """获取行业筛选下拉框的候选项（申万一级行业）。
