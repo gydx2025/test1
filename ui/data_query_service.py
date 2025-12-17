@@ -118,6 +118,8 @@ class DataQueryService:
             查询结果DataFrame
         """
         try:
+            logger.info("=== 开始数据查询 ===")
+            
             # 优先使用新的多科目接口
             if subject_codes is None and subject_code:
                 subject_codes = [subject_code]
@@ -125,11 +127,19 @@ class DataQueryService:
                 # 默认查询非经营性房地产资产
                 subject_codes = ['non_op_real_estate']
             
+            logger.info(f"科目代码: {subject_codes}")
+            logger.info(f"股票代码: {stock_codes}, 股票名称: {stock_names}")
+            logger.info(f"市场: {market}, 行业: {industry}, 时点: {time_points}")
+            
             # 如果没有股票代码，则获取所有股票
             if not stock_codes and not stock_names:
+                logger.info("未指定股票，尝试获取所有股票...")
                 stock_list = self.get_stock_list()
                 if not stock_list.empty:
                     stock_codes = stock_list['code'].tolist()
+                    logger.info(f"获取了 {len(stock_codes)} 只股票")
+                else:
+                    logger.warning("未能获取到股票列表")
             
             # 构建查询SQL
             sql = """
@@ -156,6 +166,7 @@ class DataQueryService:
                 code_placeholders = ','.join(['?' for _ in stock_codes])
                 sql += f" AND s.code IN ({code_placeholders})"
                 params.extend(stock_codes)
+                logger.info(f"添加股票代码过滤: {len(stock_codes)} 只股票")
             
             # 股票名称模糊搜索
             if stock_names:
@@ -164,6 +175,7 @@ class DataQueryService:
                     name_conditions.append("s.name LIKE ?")
                     params.append(f"%{name}%")
                 sql += f" AND ({' OR '.join(name_conditions)})"
+                logger.info(f"添加股票名称模糊搜索: {stock_names}")
             
             # 市场过滤
             if market and market != '全部':
@@ -175,11 +187,13 @@ class DataQueryService:
                 if market in market_map:
                     sql += " AND s.market = ?"
                     params.append(market_map[market])
+                    logger.info(f"添加市场过滤: {market}")
 
             # 行业过滤（申万一级）
             if industry and industry != '全行业':
                 sql += " AND i.l1 = ?"
                 params.append(industry)
+                logger.info(f"添加行业过滤: {industry}")
 
             # 时点过滤（兼容年份/财报期日期）
             if time_points:
@@ -203,6 +217,7 @@ class DataQueryService:
                         year_conditions.append("fd.year = ?")
                         params.append(y)
                     sql += f" AND ({' OR '.join(year_conditions)})"
+                    logger.info(f"添加年份过滤: {years}")
             
             # 科目过滤 - 支持多科目查询
             if subject_codes:
@@ -215,29 +230,34 @@ class DataQueryService:
                 
                 if has_financial_data:
                     sql += " AND fd.non_op_real_estate IS NOT NULL"
+                    logger.info("添加科目过滤: 非经营性房地产资产")
                 else:
                     # 对于新的科目字段，如果数据库中没有相应数据，返回空结果
                     logger.warning(f"科目 {subject_codes} 在当前数据库中未找到对应数据字段")
             
             sql += " ORDER BY s.code, fd.year"
             
+            logger.info(f"执行SQL查询...")
+            
             # 执行查询
             df = pd.read_sql_query(sql, self._get_connection(), params=params)
             
-            logger.info(f"查询完成，返回 {len(df)} 条记录")
+            logger.info(f"数据库查询完成，返回 {len(df)} 条记录")
             
             # 如果没有数据，尝试从主要数据源查询
             if df.empty and stock_codes:
                 logger.info("数据库中无数据，尝试从主要数据源获取数据...")
                 try:
                     df = self._query_from_main_source(stock_codes, subject_codes[0] if subject_codes else 'non_op_real_estate', time_points)
+                    logger.info(f"从主要数据源获取了 {len(df)} 条记录")
                 except Exception as e:
                     logger.warning(f"从主要数据源获取数据失败: {e}")
             
+            logger.info(f"=== 数据查询完成，共返回 {len(df)} 条记录 ===")
             return df
             
         except Exception as e:
-            logger.error(f"数据查询失败: {str(e)}")
+            logger.error(f"数据查询失败: {str(e)}", exc_info=True)
             raise
     
     def _query_from_main_source(self, stock_codes: List[str], subject_code: str, time_points: List[str]) -> pd.DataFrame:
@@ -441,14 +461,21 @@ class DataQueryService:
         Returns:
             SQLite连接对象
         """
-        if not os.path.exists(self.db_path):
-            # 如果数据库不存在，创建一个空的
-            conn = sqlite3.connect(self.db_path)
-            # 创建基本表结构
-            self._create_basic_tables(conn)
-            return conn
-        else:
-            return sqlite3.connect(self.db_path)
+        try:
+            if not os.path.exists(self.db_path):
+                logger.info(f"数据库不存在，创建新数据库: {self.db_path}")
+                # 如果数据库不存在，创建一个空的
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                # 创建基本表结构
+                self._create_basic_tables(conn)
+                logger.info("数据库创建完成")
+                return conn
+            else:
+                logger.debug(f"连接到数据库: {self.db_path}")
+                return sqlite3.connect(self.db_path, timeout=30)
+        except Exception as e:
+            logger.error(f"获取数据库连接失败: {str(e)}", exc_info=True)
+            raise
     
     def _create_basic_tables(self, conn: sqlite3.Connection):
         """

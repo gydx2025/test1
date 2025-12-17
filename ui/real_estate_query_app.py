@@ -9,6 +9,14 @@ import os
 from typing import List, Dict
 from datetime import datetime
 import pandas as pd
+import logging
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # PyQt5导入
 from PyQt5.QtWidgets import (
@@ -61,6 +69,7 @@ class QueryWorker(QThread):
     def run(self):
         """执行查询"""
         try:
+            logger.info("=== 开始查询线程 ===")
             self.progress.emit(10)
             
             # 准备查询参数
@@ -71,15 +80,24 @@ class QueryWorker(QThread):
             codes_text = self.query_params.get('stock_codes', '').strip()
             names_text = self.query_params.get('stock_names', '').strip()
             
+            logger.info(f"股票代码输入: {codes_text}")
+            logger.info(f"股票名称输入: {names_text}")
+            
             if codes_text:
                 stock_codes = [code.strip() for code in codes_text.split(',') if code.strip()]
             
             if names_text:
                 stock_names = [name.strip() for name in names_text.split(',') if name.strip()]
             
+            logger.info(f"解析后的股票代码: {stock_codes}")
+            logger.info(f"解析后的股票名称: {stock_names}")
+            
             market = self.query_params.get('market', '全部')
-            subject_code = self.query_params.get('subject_code')
+            subject_codes = self.query_params.get('subject_codes', [])
             industry = self.query_params.get('industry', '全行业')
+            
+            logger.info(f"市场: {market}, 行业: {industry}")
+            logger.info(f"科目代码: {subject_codes}")
 
             # 处理时点：兼容年份/财报期日期
             time_points: List[str] = []
@@ -99,24 +117,29 @@ class QueryWorker(QThread):
                     token = token.replace('/', '-')
                     time_points.append(token)
 
+            logger.info(f"时点: {time_points}")
             self.progress.emit(30)
 
             # 执行查询
+            logger.info("开始执行数据查询...")
             df = self.query_service.query_data(
-                stock_codes=stock_codes,
-                stock_names=stock_names,
+                stock_codes=stock_codes if stock_codes else None,
+                stock_names=stock_names if stock_names else None,
                 market=market,
-                time_points=time_points,
-                subject_code=subject_code,
+                time_points=time_points if time_points else None,
+                subject_codes=subject_codes if subject_codes else None,
                 industry=industry
             )
             
+            logger.info(f"查询完成，返回 {len(df)} 条记录")
             self.progress.emit(100)
             
             # 发射完成信号
             self.finished.emit(df)
+            logger.info("=== 查询线程完成 ===")
             
         except Exception as e:
+            logger.error(f"查询过程中发生错误: {str(e)}", exc_info=True)
             # 发射错误信号
             self.error.emit(str(e))
 
@@ -410,7 +433,7 @@ class RealEstateQueryApp(QMainWindow):
         if hasattr(self, 'clear_subjects_button'):
             self.clear_subjects_button.setVisible(False)
     
-    def on_time_point_changed(self):
+    def on_time_point_changed(self, date=None):
         """财报期变化处理 - 实时更新状态栏显示"""
         selected_dates = self._collect_selected_report_dates()
         if selected_dates:
@@ -419,34 +442,6 @@ class RealEstateQueryApp(QMainWindow):
         else:
             self.statusBar().showMessage("就绪 - 请选择财报期")
             
-    def reset_form(self):
-        """重置表单"""
-        # 重置输入框
-        self.stock_code_input.clear()
-        self.stock_name_input.clear()
-        
-        # 重置下拉框
-        self.market_combo.setCurrentIndex(0)
-        self.industry_combo.setCurrentIndex(0)
-        
-        # 重置时点选择
-        empty_date = QDate(1900, 1, 1)
-        for date_edit in self.time_edits:
-            date_edit.setDate(empty_date)
-            
-        # 清除已选择的科目
-        self.clear_selected_subjects()
-        
-        # 重置状态栏
-        self.statusBar().showMessage("表单已重置")
-        
-        # 清空表格数据
-        from PyQt5.QtGui import QStandardItemModel
-        self.result_table.setModel(QStandardItemModel())
-        
-        # 禁用导出按钮
-        self.export_button.setEnabled(False)
-
     @staticmethod
     def _is_time_edit_empty(date_edit: QDateEdit) -> bool:
         return date_edit.date() == date_edit.minimumDate()
@@ -614,25 +609,35 @@ class RealEstateQueryApp(QMainWindow):
     
     def on_query_finished(self, df: pd.DataFrame):
         """查询完成处理"""
-        self.current_data = df
-        
-        # 更新界面
-        self.set_ui_enabled(True)
-        self.progress_bar.setVisible(False)
-        
-        # 显示结果
-        self.display_results(df)
-        
-        # 更新状态
-        if df.empty:
-            self.statusBar().showMessage("查询完成：无数据")
-            QMessageBox.information(self, "提示", "未找到符合条件的数据")
-        else:
-            self.statusBar().showMessage(f"查询完成：共 {len(df)} 条记录")
-            self.export_button.setEnabled(True)
+        try:
+            logger.info(f"查询完成，返回 {len(df)} 条记录")
+            self.current_data = df
+            
+            # 更新界面
+            self.set_ui_enabled(True)
+            self.progress_bar.setVisible(False)
+            
+            # 显示结果
+            self.display_results(df)
+            
+            # 更新状态
+            if df.empty:
+                self.statusBar().showMessage("查询完成：无数据")
+                logger.info("查询结果为空")
+                QMessageBox.information(self, "提示", "未找到符合条件的数据")
+            else:
+                self.statusBar().showMessage(f"查询完成：共 {len(df)} 条记录")
+                self.export_button.setEnabled(True)
+                logger.info(f"成功显示查询结果，共 {len(df)} 条记录")
+        except Exception as e:
+            logger.error(f"处理查询结果时出错: {str(e)}", exc_info=True)
+            self.set_ui_enabled(True)
+            self.progress_bar.setVisible(False)
+            QMessageBox.critical(self, "处理错误", f"处理查询结果时出错：\n{str(e)}")
     
     def on_query_error(self, error_msg: str):
         """查询错误处理"""
+        logger.error(f"查询过程中发生错误: {error_msg}")
         self.set_ui_enabled(True)
         self.progress_bar.setVisible(False)
         self.statusBar().showMessage("查询失败")
@@ -644,7 +649,6 @@ class RealEstateQueryApp(QMainWindow):
         self.query_button.setEnabled(enabled)
         self.reset_button.setEnabled(enabled)
         self.subject_combo.setEnabled(enabled)
-        self.subject_input.setEnabled(enabled)
 
         for date_edit in self.time_edits:
             date_edit.setEnabled(enabled)
@@ -667,39 +671,55 @@ class RealEstateQueryApp(QMainWindow):
         if df.empty:
             # 清空表格
             self.result_table.setModel(None)
+            logger.info("查询结果为空")
             return
         
-        # 创建数据模型
-        from PyQt5.QtGui import QStandardItemModel, QStandardItem
-        
-        model = QStandardItemModel()
-        
-        # 设置列标题
-        headers = list(df.columns)
-        model.setHorizontalHeaderLabels(headers)
-        
-        # 添加数据行
-        for row_idx, row in df.iterrows():
-            row_items = []
-            for col_idx, value in enumerate(row):
-                item = QStandardItem(str(value) if pd.notna(value) else "")
-                item.setToolTip(str(value) if pd.notna(value) else "")
-                row_items.append(item)
-            model.appendRow(row_items)
-        
-        # 设置表格模型
-        self.result_table.setModel(model)
-        
-        # 设置列宽
-        header = self.result_table.horizontalHeader()
-        for i, col_name in enumerate(headers):
-            # 根据列名设置合适的宽度
-            if "代码" in col_name or "名称" in col_name:
-                header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-            elif "行业" in col_name:
-                header.setSectionResizeMode(i, QHeaderView.Stretch)
-            else:
-                header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        try:
+            logger.info(f"开始显示 {len(df)} 条查询结果")
+            
+            # 创建数据模型
+            from PyQt5.QtGui import QStandardItemModel, QStandardItem
+            
+            model = QStandardItemModel()
+            
+            # 设置列标题
+            headers = list(df.columns)
+            model.setHorizontalHeaderLabels(headers)
+            
+            # 限制显示行数，防止UI卡顿（超过5000行只显示前5000行）
+            max_rows = min(len(df), 5000)
+            if len(df) > max_rows:
+                logger.warning(f"查询结果过多（{len(df)} 行），只显示前 {max_rows} 行")
+            
+            # 添加数据行
+            for row_idx in range(max_rows):
+                row = df.iloc[row_idx]
+                row_items = []
+                for col_idx, value in enumerate(row):
+                    item = QStandardItem(str(value) if pd.notna(value) else "")
+                    item.setToolTip(str(value) if pd.notna(value) else "")
+                    row_items.append(item)
+                model.appendRow(row_items)
+            
+            # 设置表格模型
+            self.result_table.setModel(model)
+            
+            # 设置列宽
+            header = self.result_table.horizontalHeader()
+            for i, col_name in enumerate(headers):
+                # 根据列名设置合适的宽度
+                if "代码" in col_name or "名称" in col_name:
+                    header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+                elif "行业" in col_name:
+                    header.setSectionResizeMode(i, QHeaderView.Stretch)
+                else:
+                    header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+            
+            logger.info("查询结果显示完成")
+            
+        except Exception as e:
+            logger.error(f"显示查询结果时出错: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "显示错误", f"显示查询结果时出错：\n{str(e)}")
     
     def export_data(self):
         """导出数据"""
@@ -729,27 +749,6 @@ class RealEstateQueryApp(QMainWindow):
                 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出过程中发生错误：\n{str(e)}")
-    
-    def reset_form(self):
-        """重置表单"""
-        self.subject_combo.setCurrentIndex(0)
-        self.subject_input.clear()
-
-        for date_edit in self.time_edits:
-            date_edit.setDate(date_edit.minimumDate())
-
-        self.standard_date_combo.setCurrentIndex(0)
-
-        self.stock_code_input.clear()
-        self.stock_name_input.clear()
-        self.market_combo.setCurrentIndex(0)
-        self.industry_combo.setCurrentIndex(0)
-
-        self.current_data = pd.DataFrame()
-        self.result_table.setModel(None)
-        self.export_button.setEnabled(False)
-
-        self.statusBar().showMessage("已重置")
     
     def closeEvent(self, event):
         """关闭事件"""
