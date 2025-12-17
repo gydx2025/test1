@@ -10,6 +10,8 @@ import logging
 from typing import List, Dict
 import os
 import re
+import json
+from datetime import datetime, date
 
 logger = logging.getLogger(__name__)
 
@@ -17,16 +19,22 @@ logger = logging.getLogger(__name__)
 class DataQueryService:
     """数据查询服务类"""
     
-    def __init__(self, db_path: str = 'astock_data.db'):
+    def __init__(self, cache_dir: str = 'local_cache'):
         """
         初始化查询服务
         
         Args:
-            db_path: 数据库路径
+            cache_dir: 本地缓存目录
         """
-        self.db_path = db_path
+        self.cache_dir = cache_dir
+        self.cache_db_path = os.path.join(cache_dir, 'stock_base_data.db')
+        self.cache_meta_path = os.path.join(cache_dir, 'cache_meta.json')
+        self.db_path = self.cache_db_path  # 保持向后兼容性
         self.available_subjects = self._load_available_subjects()
         self.markets = ['全部', '沪市', '深市', '北市']
+        
+        # 确保缓存目录存在
+        os.makedirs(cache_dir, exist_ok=True)
     
     def _load_available_subjects(self) -> List[Dict]:
         """加载资产负债表科目列表。
@@ -577,26 +585,30 @@ class DataQueryService:
             "机械设备"
         ]
     
-    def export_to_excel(self, df: pd.DataFrame, file_path: str) -> bool:
+    def export_to_excel(self, df: pd.DataFrame, file_path: str, 
+                       subject_codes: List[str] = None,
+                       report_dates: List[str] = None,
+                       filters: Dict = None) -> bool:
         """
-        导出数据到Excel
+        导出数据到Excel（支持两个Sheet）
         
         Args:
             df: 要导出的数据
             file_path: 导出文件路径
+            subject_codes: 科目代码列表
+            report_dates: 财报期列表
+            filters: 查询过滤条件
             
         Returns:
             是否成功
         """
         try:
             with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-                # 写入主数据
+                # Sheet1: 写入查询结果
                 df.to_excel(writer, sheet_name='查询结果', index=False)
                 
-                # 获取工作表对象
+                # 设置Sheet1列宽
                 worksheet = writer.sheets['查询结果']
-                
-                # 设置列宽
                 for column in worksheet.columns:
                     max_length = 0
                     column_letter = column[0].column_letter
@@ -608,6 +620,9 @@ class DataQueryService:
                             pass
                     adjusted_width = min(max_length + 2, 50)
                     worksheet.column_dimensions[column_letter].width = adjusted_width
+                
+                # Sheet2: 写入元数据和查询条件
+                self._add_metadata_sheet(writer, df, subject_codes, report_dates, filters)
             
             logger.info(f"数据已导出到: {file_path}")
             return True
@@ -615,6 +630,657 @@ class DataQueryService:
         except Exception as e:
             logger.error(f"导出Excel失败: {str(e)}")
             return False
+    
+    def _add_metadata_sheet(self, writer, df: pd.DataFrame, 
+                           subject_codes: List[str] = None,
+                           report_dates: List[str] = None,
+                           filters: Dict = None):
+        """添加元数据Sheet"""
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment
+            
+            # 创建元数据Sheet
+            workbook = writer.book
+            worksheet = workbook.create_sheet('元数据')
+            
+            # 设置样式
+            header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+            header_font = Font(bold=True)
+            
+            row = 1
+            
+            # 1. 查询时点
+            worksheet[f'A{row}'] = '查询时点'
+            worksheet[f'A{row}'].fill = header_fill
+            worksheet[f'A{row}'].font = header_font
+            worksheet[f'B{row}'] = ', '.join(report_dates) if report_dates else '无'
+            worksheet.column_dimensions['A'].width = 20
+            worksheet.column_dimensions['B'].width = 40
+            row += 1
+            
+            # 2. 选定科目
+            worksheet[f'A{row}'] = '选定科目'
+            worksheet[f'A{row}'].fill = header_fill
+            worksheet[f'A{row}'].font = header_font
+            if subject_codes:
+                subject_names = [self._get_subject_display_name(code) for code in subject_codes]
+                worksheet[f'B{row}'] = ', '.join(subject_names)
+            else:
+                worksheet[f'B{row}'] = '无'
+            row += 1
+            
+            # 3. 行业筛选
+            worksheet[f'A{row}'] = '行业筛选'
+            worksheet[f'A{row}'].fill = header_fill
+            worksheet[f'A{row}'].font = header_font
+            worksheet[f'B{row}'] = filters.get('industry', '全行业') if filters else '全行业'
+            row += 1
+            
+            # 4. 股票筛选
+            worksheet[f'A{row}'] = '股票筛选'
+            worksheet[f'A{row}'].fill = header_fill
+            worksheet[f'A{row}'].font = header_font
+            if filters and (filters.get('stock_codes') or filters.get('stock_names')):
+                codes_str = ', '.join(filters.get('stock_codes', []))
+                names_str = ', '.join(filters.get('stock_names', []))
+                worksheet[f'B{row}'] = (codes_str + ', ' + names_str).strip(', ')
+            else:
+                worksheet[f'B{row}'] = '无'
+            row += 1
+            
+            # 5. 市场筛选
+            worksheet[f'A{row}'] = '市场筛选'
+            worksheet[f'A{row}'].fill = header_fill
+            worksheet[f'A{row}'].font = header_font
+            worksheet[f'B{row}'] = filters.get('market', '全部') if filters else '全部'
+            row += 1
+            
+            # 6. 生成时间
+            worksheet[f'A{row}'] = '生成时间'
+            worksheet[f'A{row}'].fill = header_fill
+            worksheet[f'A{row}'].font = header_font
+            worksheet[f'B{row}'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            row += 1
+            
+            # 7. 查询结果统计
+            worksheet[f'A{row}'] = '结果统计'
+            worksheet[f'A{row}'].fill = header_fill
+            worksheet[f'A{row}'].font = header_font
+            worksheet[f'B{row}'] = f'成功 {len(df)} 条，失败 0 条'
+            row += 1
+            
+        except Exception as e:
+            logger.warning(f"添加元数据Sheet失败: {e}")
+    
+    def init_base_cache(self) -> Dict:
+        """
+        初始化本地缓存库
+        
+        Returns:
+            初始化结果和统计信息
+        """
+        try:
+            logger.info("=== 开始初始化缓存库 ===")
+            
+            # 检查缓存库是否已存在
+            if os.path.exists(self.cache_db_path):
+                logger.info("缓存库已存在，跳过初始化")
+                return {
+                    'success': True,
+                    'message': '缓存库已存在',
+                    'db_path': self.cache_db_path,
+                    'stock_count': self._get_cache_stock_count()
+                }
+            
+            # 创建新的缓存库
+            conn = self._get_cache_connection()
+            self._create_cache_tables(conn)
+            
+            # 从采集器获取完整数据
+            from astock_real_estate_collector import AStockRealEstateDataCollector
+            collector = AStockRealEstateDataCollector()
+            
+            # 获取股票列表
+            logger.info("获取股票列表...")
+            stock_info_list = collector.get_stock_list()
+            
+            if not stock_info_list:
+                logger.warning("未能获取股票列表")
+                return {
+                    'success': False,
+                    'message': '未能获取股票列表',
+                    'stock_count': 0
+                }
+            
+            logger.info(f"获取到 {len(stock_info_list)} 只股票")
+            
+            # 获取行业分类（通过财务查询服务或其他方式）
+            logger.info("获取行业分类...")
+            industry_data = self._fetch_industry_classifications(stock_info_list)
+            
+            # 批量插入股票和行业数据
+            logger.info("插入缓存数据...")
+            self._insert_stocks_to_cache(conn, stock_info_list, industry_data)
+            
+            # 更新缓存元数据
+            self._update_cache_metadata()
+            
+            conn.close()
+            
+            stock_count = len(stock_info_list)
+            logger.info(f"=== 缓存库初始化完成，共 {stock_count} 只股票 ===")
+            
+            return {
+                'success': True,
+                'message': '缓存库初始化成功',
+                'db_path': self.cache_db_path,
+                'stock_count': stock_count,
+                'industry_count': len(industry_data)
+            }
+            
+        except Exception as e:
+            logger.error(f"初始化缓存库失败: {e}", exc_info=True)
+            return {
+                'success': False,
+                'message': f'初始化失败: {str(e)}',
+                'stock_count': 0
+            }
+    
+    def update_daily_cache(self) -> Dict:
+        """
+        执行每日缓存更新
+        
+        Returns:
+            更新结果和统计信息
+        """
+        try:
+            logger.info("=== 开始每日缓存更新 ===")
+            
+            # 检查缓存库是否存在
+            if not os.path.exists(self.cache_db_path):
+                logger.info("缓存库不存在，执行初始化")
+                return self.init_base_cache()
+            
+            # 检查是否已在今天更新过
+            if not self._should_update_today():
+                logger.info("今天已更新过，跳过更新")
+                return {
+                    'success': True,
+                    'message': '今天已更新过',
+                    'need_update': False
+                }
+            
+            # 执行增量更新
+            from astock_real_estate_collector import AStockRealEstateDataCollector
+            collector = AStockRealEstateDataCollector()
+            
+            # 获取最新的股票数据
+            logger.info("获取最新股票列表...")
+            new_stock_list = collector.get_stock_list()
+            
+            if not new_stock_list:
+                logger.warning("未能获取新的股票列表")
+                return {
+                    'success': False,
+                    'message': '未能获取新的股票列表'
+                }
+            
+            # 比对和更新
+            conn = self._get_cache_connection()
+            
+            # 获取行业分类
+            industry_data = self._fetch_industry_classifications(new_stock_list)
+            
+            # 执行增量更新
+            stats = self._incremental_update_cache(conn, new_stock_list, industry_data)
+            
+            # 更新缓存元数据
+            self._update_cache_metadata()
+            
+            conn.close()
+            
+            logger.info(f"=== 缓存更新完成 ===")
+            
+            return {
+                'success': True,
+                'message': '缓存更新成功',
+                'added': stats.get('added', 0),
+                'updated': stats.get('updated', 0),
+                'deleted': stats.get('deleted', 0)
+            }
+            
+        except Exception as e:
+            logger.error(f"缓存更新失败: {e}", exc_info=True)
+            return {
+                'success': False,
+                'message': f'更新失败: {str(e)}'
+            }
+    
+    def query_base_data_from_cache(self, filters: Dict = None) -> pd.DataFrame:
+        """
+        从缓存快速查询基础数据
+        
+        Args:
+            filters: 过滤条件
+                - industry: 行业过滤 (三级申万分类或通用行业)
+                - market: 市场过滤 (沪/深/北/全部)
+                - stock_codes: 股票代码过滤
+                - stock_names: 股票名称模糊过滤
+        
+        Returns:
+            基础数据 DataFrame
+        """
+        try:
+            logger.info("从缓存查询基础数据...")
+            
+            if not os.path.exists(self.cache_db_path):
+                logger.warning("缓存库不存在")
+                return pd.DataFrame()
+            
+            filters = filters or {}
+            
+            # 构建查询SQL
+            conn = self._get_cache_connection()
+            query = """
+            SELECT 
+                s.code, s.name, s.market, s.list_date,
+                i.shenwan_level1, i.shenwan_level2, i.shenwan_level3, 
+                i.general_industry, s.update_time, s.data_source
+            FROM stocks s
+            LEFT JOIN industries i ON s.code = i.code
+            WHERE 1=1
+            """
+            
+            params = []
+            
+            # 应用过滤条件
+            if filters.get('market') and filters['market'] != '全部':
+                market_map = {'沪': 'SH', '深': 'SZ', '北': 'BJ'}
+                market_code = market_map.get(filters['market'], '')
+                if market_code:
+                    query += " AND s.market LIKE ?"
+                    params.append(f"{market_code}%")
+            
+            if filters.get('stock_codes'):
+                codes_list = filters['stock_codes']
+                placeholders = ','.join(['?' for _ in codes_list])
+                query += f" AND s.code IN ({placeholders})"
+                params.extend(codes_list)
+            
+            if filters.get('stock_names'):
+                for name in filters['stock_names']:
+                    query += " AND s.name LIKE ?"
+                    params.append(f"%{name}%")
+            
+            if filters.get('industry'):
+                industry = filters['industry']
+                if industry != '全行业':
+                    # 支持三级行业或通用行业
+                    query += " AND (i.shenwan_level1 = ? OR i.shenwan_level2 = ? OR i.shenwan_level3 = ? OR i.general_industry = ?)"
+                    params.extend([industry, industry, industry, industry])
+            
+            query += " ORDER BY s.code"
+            
+            # 执行查询
+            df = pd.read_sql_query(query, conn, params=params)
+            conn.close()
+            
+            logger.info(f"从缓存查询到 {len(df)} 条记录")
+            return df
+            
+        except Exception as e:
+            logger.error(f"从缓存查询失败: {e}", exc_info=True)
+            return pd.DataFrame()
+    
+    def query_subject_data_dynamic(self, subject_codes: List[str], 
+                                   report_dates: List[str], 
+                                   stock_list: List[str] = None) -> pd.DataFrame:
+        """
+        实时查询科目数据，支持多源和循环补齐
+        
+        Args:
+            subject_codes: 科目代码列表
+            report_dates: 财报期列表
+            stock_list: 股票代码列表
+        
+        Returns:
+            科目数据 DataFrame
+        """
+        try:
+            logger.info(f"开始实时查询科目数据: {len(subject_codes)} 个科目, {len(stock_list)} 只股票")
+            
+            from financial_query_service import FinancialQueryService
+            
+            query_service = FinancialQueryService()
+            all_results = []
+            
+            # 构建基础结果字典
+            result_dict = {}
+            for code in stock_list:
+                result_dict[code] = {'code': code}
+            
+            # 为每个科目查询数据
+            for subject_code in subject_codes:
+                subject_name = self._get_subject_display_name(subject_code)
+                logger.info(f"查询科目: {subject_name} ({subject_code})")
+                
+                try:
+                    # 执行多源查询
+                    for report_date in report_dates:
+                        col_name = f"{report_date}_{subject_name}"
+                        
+                        # 为每只股票查询数据
+                        for code in stock_list:
+                            try:
+                                query_params = {
+                                    'stock_codes': [code],
+                                    'report_date': report_date,
+                                    'subject': subject_name,
+                                    'return_format': 'dataframe'
+                                }
+                                
+                                result = query_service.execute_query(query_params)
+                                
+                                if result.success and result.dataframe is not None and len(result.dataframe) > 0:
+                                    value = result.dataframe.iloc[0].get(subject_name)
+                                    result_dict[code][col_name] = value
+                                else:
+                                    result_dict[code][col_name] = None
+                                    
+                            except Exception as e:
+                                logger.warning(f"查询股票 {code} 科目 {subject_name} 时点 {report_date} 失败: {e}")
+                                result_dict[code][col_name] = None
+                
+                except Exception as e:
+                    logger.warning(f"查询科目 {subject_name} 失败: {e}")
+            
+            # 转换为DataFrame
+            result_df = pd.DataFrame(list(result_dict.values()))
+            logger.info(f"实时查询完成，返回 {len(result_df)} 条记录")
+            return result_df
+            
+        except Exception as e:
+            logger.error(f"实时查询科目数据失败: {e}", exc_info=True)
+            return pd.DataFrame()
+    
+    def execute_full_query(self, params: Dict) -> Dict:
+        """
+        综合查询方法，整合所有操作
+        
+        Args:
+            params: 查询参数
+                - subject_codes: 科目代码列表
+                - report_dates: 财报期列表
+                - industry: 行业过滤
+                - stock_codes: 股票代码
+                - stock_names: 股票名称
+                - market: 市场
+        
+        Returns:
+            查询结果和统计信息
+        """
+        try:
+            logger.info("=== 开始综合查询 ===")
+            
+            # 1. 从缓存加载基础数据
+            logger.info("加载基础数据...")
+            filters = {
+                'industry': params.get('industry', '全行业'),
+                'market': params.get('market', '全部'),
+                'stock_codes': params.get('stock_codes'),
+                'stock_names': params.get('stock_names')
+            }
+            
+            base_df = self.query_base_data_from_cache(filters)
+            
+            if base_df.empty:
+                logger.warning("未找到符合条件的基础数据")
+                return {
+                    'success': False,
+                    'message': '未找到符合条件的数据',
+                    'result': pd.DataFrame()
+                }
+            
+            logger.info(f"筛选到 {len(base_df)} 只符合条件的股票")
+            
+            # 2. 查询科目数据
+            stock_codes = base_df['code'].tolist()
+            subject_codes = params.get('subject_codes', ['INVEST_REALESTATE'])
+            report_dates = params.get('report_dates', ['2023-12-31'])
+            
+            logger.info(f"查询科目数据: {subject_codes}")
+            subject_df = self.query_subject_data_dynamic(subject_codes, report_dates, stock_codes)
+            
+            # 3. 合并结果
+            if not subject_df.empty:
+                result_df = pd.merge(base_df, subject_df, on='code', how='left')
+            else:
+                result_df = base_df
+            
+            logger.info(f"=== 综合查询完成，共返回 {len(result_df)} 条记录 ===")
+            
+            return {
+                'success': True,
+                'message': '查询成功',
+                'result': result_df,
+                'total': len(result_df),
+                'success_count': len(result_df),
+                'failed_count': 0
+            }
+            
+        except Exception as e:
+            logger.error(f"综合查询失败: {e}", exc_info=True)
+            return {
+                'success': False,
+                'message': f'查询失败: {str(e)}',
+                'result': pd.DataFrame()
+            }
+    
+    # ========== 辅助方法 ==========
+    
+    def _get_cache_connection(self) -> sqlite3.Connection:
+        """获取缓存数据库连接"""
+        return sqlite3.connect(self.cache_db_path, timeout=30)
+    
+    def _create_cache_tables(self, conn: sqlite3.Connection):
+        """创建缓存表结构"""
+        cursor = conn.cursor()
+        
+        # 创建股票表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS stocks (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            market TEXT,
+            list_date DATE,
+            update_time TIMESTAMP,
+            data_source TEXT
+        )
+        ''')
+        
+        # 创建行业表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS industries (
+            code TEXT PRIMARY KEY,
+            shenwan_level1 TEXT,
+            shenwan_level2 TEXT,
+            shenwan_level3 TEXT,
+            general_industry TEXT,
+            data_source TEXT,
+            FOREIGN KEY (code) REFERENCES stocks(code)
+        )
+        ''')
+        
+        # 创建索引
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_stocks_code ON stocks(code)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_stocks_market ON stocks(market)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_industries_shenwan1 ON industries(shenwan_level1)')
+        
+        conn.commit()
+    
+    def _insert_stocks_to_cache(self, conn: sqlite3.Connection, 
+                                stock_list: List[Dict], 
+                                industry_data: Dict):
+        """将股票和行业数据插入缓存"""
+        cursor = conn.cursor()
+        
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        
+        for stock in stock_list:
+            code = stock.get('code', '')
+            if not code:
+                continue
+            
+            try:
+                cursor.execute('''
+                INSERT OR REPLACE INTO stocks (code, name, market, list_date, update_time, data_source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    code,
+                    stock.get('name', ''),
+                    stock.get('market', ''),
+                    stock.get('list_date', ''),
+                    now,
+                    stock.get('data_source', 'collector')
+                ))
+                
+                # 插入行业信息
+                industry_info = industry_data.get(code, {})
+                cursor.execute('''
+                INSERT OR REPLACE INTO industries (code, shenwan_level1, shenwan_level2, shenwan_level3, general_industry, data_source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    code,
+                    industry_info.get('shenwan_level1', ''),
+                    industry_info.get('shenwan_level2', ''),
+                    industry_info.get('shenwan_level3', ''),
+                    industry_info.get('general_industry', ''),
+                    industry_info.get('data_source', 'collector')
+                ))
+                
+            except Exception as e:
+                logger.warning(f"插入股票 {code} 失败: {e}")
+        
+        conn.commit()
+    
+    def _incremental_update_cache(self, conn: sqlite3.Connection,
+                                  new_stock_list: List[Dict],
+                                  industry_data: Dict) -> Dict:
+        """执行缓存增量更新"""
+        cursor = conn.cursor()
+        
+        # 获取当前缓存中的股票代码集合
+        cursor.execute('SELECT code FROM stocks')
+        old_codes = set(row[0] for row in cursor.fetchall())
+        
+        new_codes = set(stock.get('code', '') for stock in new_stock_list if stock.get('code', ''))
+        
+        # 计算差异
+        added_codes = new_codes - old_codes
+        updated_codes = new_codes & old_codes
+        deleted_codes = old_codes - new_codes
+        
+        # 插入新股票
+        for stock in new_stock_list:
+            if stock.get('code', '') in added_codes:
+                self._insert_stocks_to_cache(conn, [stock], {stock.get('code'): industry_data.get(stock.get('code', ''), {})})
+        
+        # 更新现有股票
+        for stock in new_stock_list:
+            if stock.get('code', '') in updated_codes:
+                self._insert_stocks_to_cache(conn, [stock], {stock.get('code'): industry_data.get(stock.get('code', ''), {})})
+        
+        return {
+            'added': len(added_codes),
+            'updated': len(updated_codes),
+            'deleted': len(deleted_codes)
+        }
+    
+    def _fetch_industry_classifications(self, stock_list: List[Dict]) -> Dict:
+        """从采集器或其他来源获取行业分类"""
+        try:
+            industry_data = {}
+            
+            for stock in stock_list:
+                code = stock.get('code', '')
+                if not code:
+                    continue
+                
+                # 从stock对象中提取行业信息
+                industry_data[code] = {
+                    'shenwan_level1': stock.get('shenwan_level1', stock.get('l1', stock.get('industry', ''))),
+                    'shenwan_level2': stock.get('shenwan_level2', stock.get('l2', '')),
+                    'shenwan_level3': stock.get('shenwan_level3', stock.get('l3', '')),
+                    'general_industry': stock.get('general_industry', stock.get('industry', '')),
+                    'data_source': 'collector'
+                }
+            
+            logger.info(f"获取到 {len(industry_data)} 只股票的行业分类")
+            return industry_data
+            
+        except Exception as e:
+            logger.warning(f"获取行业分类失败: {e}")
+            return {}
+    
+    def _should_update_today(self) -> bool:
+        """判断今天是否需要更新"""
+        try:
+            from datetime import datetime, date
+            
+            if not os.path.exists(self.cache_meta_path):
+                return True
+            
+            import json
+            with open(self.cache_meta_path, 'r') as f:
+                meta = json.load(f)
+            
+            last_update = meta.get('last_update_date', '')
+            today = str(date.today())
+            
+            return last_update != today
+            
+        except Exception as e:
+            logger.warning(f"判断是否需要更新失败: {e}")
+            return True
+    
+    def _update_cache_metadata(self):
+        """更新缓存元数据"""
+        try:
+            from datetime import date, datetime
+            import json
+            
+            metadata = {
+                'last_update_date': str(date.today()),
+                'last_update_time': datetime.now().isoformat(),
+                'db_path': self.cache_db_path,
+                'stock_count': self._get_cache_stock_count()
+            }
+            
+            with open(self.cache_meta_path, 'w') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"缓存元数据已更新: {metadata}")
+            
+        except Exception as e:
+            logger.warning(f"更新缓存元数据失败: {e}")
+    
+    def _get_cache_stock_count(self) -> int:
+        """获取缓存中的股票总数"""
+        try:
+            if not os.path.exists(self.cache_db_path):
+                return 0
+            
+            conn = self._get_cache_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM stocks')
+            count = cursor.fetchone()[0]
+            conn.close()
+            return count
+            
+        except Exception:
+            return 0
     
     def _get_connection(self) -> sqlite3.Connection:
         """
