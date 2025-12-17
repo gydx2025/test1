@@ -220,27 +220,82 @@ class DataQueryService:
             stock_info_map = {}
             try:
                 stock_info_list = collector.get_stock_list()
-                
+
                 for stock_info in stock_info_list:
                     code = stock_info.get('code', '')
                     if not code:
                         continue
-                    
+
                     market = stock_info.get('market', '')
                     market_display = self._get_market_display_name(market)
-                    
+
                     # 从股票代码推断市场（如果采集器返回的市场信息不可用）
                     if not market or market_display == '未知市场':
                         market_display = self._infer_market_from_code(code)
-                    
-                    stock_info_map[code] = {
+
+                    # 构建基础信息字典，包括行业分类字段
+                    base_info = {
                         '股票代码': code,
                         '股票名称': stock_info.get('name', ''),
                         '市场': market_display,
                         '上市时间': stock_info.get('list_date', '') or stock_info.get('listDate', '')
                     }
-                
-                logger.info(f"获取了 {len(stock_info_map)} 只股票的基础信息")
+
+                    # 添加行业分类字段（申万行业分类）
+                    # 尝试多种可能的字段名
+                    for field_name, standard_name in [
+                        ('shenwan_industry_level1', '申万一级行业'),
+                        ('shenwan_industry_l1', '申万一级行业'),
+                        ('shenwan_l1', '申万一级行业'),
+                        ('industry_level1', '申万一级行业'),
+                        ('l1_industry', '申万一级行业'),
+                    ]:
+                        if field_name in stock_info:
+                            base_info['申万一级行业'] = stock_info.get(field_name, '')
+                            break
+                    else:
+                        base_info['申万一级行业'] = ''
+
+                    for field_name, standard_name in [
+                        ('shenwan_industry_level2', '申万二级行业'),
+                        ('shenwan_industry_l2', '申万二级行业'),
+                        ('shenwan_l2', '申万二级行业'),
+                        ('industry_level2', '申万二级行业'),
+                        ('l2_industry', '申万二级行业'),
+                    ]:
+                        if field_name in stock_info:
+                            base_info['申万二级行业'] = stock_info.get(field_name, '')
+                            break
+                    else:
+                        base_info['申万二级行业'] = ''
+
+                    for field_name, standard_name in [
+                        ('shenwan_industry_level3', '申万三级行业'),
+                        ('shenwan_industry_l3', '申万三级行业'),
+                        ('shenwan_l3', '申万三级行业'),
+                        ('industry_level3', '申万三级行业'),
+                        ('l3_industry', '申万三级行业'),
+                    ]:
+                        if field_name in stock_info:
+                            base_info['申万三级行业'] = stock_info.get(field_name, '')
+                            break
+                    else:
+                        base_info['申万三级行业'] = ''
+
+                    for field_name, standard_name in [
+                        ('general_industry', '通用行业'),
+                        ('industry', '通用行业'),
+                        ('main_industry', '通用行业'),
+                    ]:
+                        if field_name in stock_info:
+                            base_info['通用行业'] = stock_info.get(field_name, '')
+                            break
+                    else:
+                        base_info['通用行业'] = ''
+
+                    stock_info_map[code] = base_info
+
+                logger.info(f"获取了 {len(stock_info_map)} 只股票的基础信息，包括行业分类")
             except Exception as e:
                 logger.warning(f"获取股票基础信息失败: {e}")
                 # 创建基本的股票信息映射
@@ -249,7 +304,11 @@ class DataQueryService:
                         '股票代码': code,
                         '股票名称': code,
                         '市场': self._infer_market_from_code(code),
-                        '上市时间': ''
+                        '上市时间': '',
+                        '申万一级行业': '',
+                        '申万二级行业': '',
+                        '申万三级行业': '',
+                        '通用行业': ''
                     }
                 logger.info(f"使用默认股票信息映射: {len(stock_info_map)} 只股票")
             
@@ -265,7 +324,11 @@ class DataQueryService:
                         '股票代码': code,
                         '股票名称': code,
                         '市场': self._infer_market_from_code(code),
-                        '上市时间': ''
+                        '上市时间': '',
+                        '申万一级行业': '',
+                        '申万二级行业': '',
+                        '申万三级行业': '',
+                        '通用行业': ''
                     })
             
             result_df = pd.DataFrame(base_rows)
@@ -329,21 +392,24 @@ class DataQueryService:
             # 第四步：组织列的顺序
             logger.info("第四步：组织列的顺序...")
             if not result_df.empty:
-                # 基础列
+                # 基础列（基本信息）
                 base_columns = ['股票代码', '股票名称', '上市时间', '市场']
-                
+
+                # 行业分类列
+                industry_columns = ['申万一级行业', '申万二级行业', '申万三级行业', '通用行业']
+
                 # 数据列（科目列）
                 data_columns = []
                 for col in result_df.columns:
-                    if col not in base_columns:
+                    if col not in base_columns and col not in industry_columns:
                         data_columns.append(col)
-                
+
                 # 对数据列进行排序（按时点，然后按科目）
                 data_columns.sort()
-                
-                # 最终列顺序
-                final_columns = base_columns + data_columns
-                
+
+                # 最终列顺序：基本信息 + 行业分类 + 科目数据
+                final_columns = base_columns + industry_columns + data_columns
+
                 # 只保留实际存在的列
                 existing_columns = [col for col in final_columns if col in result_df.columns]
                 result_df = result_df[existing_columns]
@@ -359,60 +425,61 @@ class DataQueryService:
             return pd.DataFrame()
     
     def _infer_market_from_code(self, stock_code: str) -> str:
-        """根据股票代码推断市场
-        
-        规则：
-        - 600xxx, 601xxx, 603xxx → 沪市
-        - 000xxx, 001xxx, 003xxx → 深市
-        - 688xxx → 沪市科创板
-        - 830xxx, 833xxx, 835xxx, 837xxx, 839xxx, 873xxx, 874xxx, 875xxx, 876xxx, 880xxx, 886xxx, 900xxx → 北交所
-        - 200xxx → 深市
-        """
-        if not stock_code:
-            return '未知市场'
-        
-        code_str = str(stock_code).strip()
-        if not code_str:
-            return '未知市场'
-        
-        first_digit = code_str[0]
-        first_three = code_str[:3]
-        
-        # 沪市
-        if first_three in ('600', '601', '603', '688'):
-            return '沪市'
-        
-        # 深市
-        if first_digit == '0' or first_three in ('200',):
-            return '深市'
-        
-        # 北交所
-        if first_digit in ('4', '8', '9'):
-            # 更细致的检查
-            if code_str.startswith(('830', '833', '835', '837', '839', '873', '874', '875', '876', '880', '886', '900')):
-                return '北交所'
-        
-        return '未知市场'
+         """根据股票代码推断市场
+
+         规则（完整的中国A股市场代码规则）：
+         - 600xxx, 601xxx, 603xxx, 605xxx → 沪市（上海主板）
+         - 688xxx, 689xxx → 沪市（科创板）
+         - 000xxx, 001xxx, 003xxx → 深市（深圳主板）
+         - 300xxx, 301xxx, 399xxx → 深市（创业板）
+         - 200xxx → 深市
+         - 830xxx, 835xxx, 837xxx, 839xxx, 873xxx, 874xxx, 875xxx, 876xxx, 880xxx, 886xxx, 900xxx → 北交所
+         """
+         if not stock_code:
+             return '未知市场'
+
+         code_str = str(stock_code).strip()
+         if not code_str:
+             return '未知市场'
+
+         first_digit = code_str[0]
+         first_three = code_str[:3]
+
+         # 沪市（上海主板 + 科创板）
+         if first_three in ('600', '601', '603', '605', '688', '689'):
+             return '沪市'
+
+         # 深市（包括主板和创业板）
+         if first_digit == '0' or first_digit == '3' or first_three in ('200',):
+             return '深市'
+
+         # 北交所
+         if first_digit in ('4', '8', '9'):
+             # 更细致的检查北交所的特定前缀
+             if code_str.startswith(('830', '835', '837', '839', '873', '874', '875', '876', '880', '886', '900')):
+                 return '北交所'
+
+         return '未知市场'
     
     def _get_market_display_name(self, market_code: str) -> str:
         """根据市场代码获取显示名称"""
         if not market_code:
             return '未知市场'
-        
+
         market_str = str(market_code).strip().upper()
-        
+
         # 如果已经是中文显示名称，直接返回
         if market_str in ('沪市', '深市', '北市', '北交所'):
             return market_str
-        
+
         market_map = {
             'SH': '沪市',
             'SHA': '沪市',
             'SHANGHAI': '沪市',
-            'SZ': '深市', 
+            'SZ': '深市',
             'SZE': '深市',
             'SHENZHEN': '深市',
-            'BJ': '北市',
+            'BJ': '北交所',  # 注意：BJ作为前缀时应映射到北交所
             'BJS': '北交所',
             'BEIJING': '北交所',
             '6': '沪市',
@@ -422,14 +489,21 @@ class DataQueryService:
             '8': '北交所',
             '9': '北交所'
         }
-        
-        # 提取市场前缀
-        if market_str.startswith(('SH', 'SZ', 'BJ')):
-            code_prefix = market_str[:2]
+
+        # 首先尝试完全匹配
+        if market_str in market_map:
+            return market_map[market_str]
+
+        # 提取市场前缀进行匹配
+        if market_str.startswith('SH'):
+            return market_map.get('SH', '未知市场')
+        elif market_str.startswith('SZ'):
+            return market_map.get('SZ', '未知市场')
+        elif market_str.startswith('BJ'):
+            return market_map.get('BJ', '未知市场')
         else:
             code_prefix = market_str[0] if market_str else '0'
-        
-        return market_map.get(code_prefix, '未知市场')
+            return market_map.get(code_prefix, '未知市场')
     
     def _get_subject_display_name(self, subject_code: str) -> str:
         """根据科目代码获取显示名称"""
@@ -497,13 +571,13 @@ class DataQueryService:
             if stock_info_list:
                 # 转换为DataFrame
                 df = pd.DataFrame(stock_info_list)
-                
+
                 # 重命名列以匹配UI期望
                 if 'code' in df.columns:
                     df = df.rename(columns={'code': '股票代码'})
                 if 'name' in df.columns:
                     df = df.rename(columns={'name': '股票名称'})
-                
+
                 # 处理市场信息
                 if 'market' in df.columns:
                     # 将市场代码转换为显示名称
@@ -515,7 +589,7 @@ class DataQueryService:
                         df['市场'] = df['股票代码'].apply(self._infer_market_from_code)
                     else:
                         df['市场'] = '未知市场'
-                
+
                 # 处理上市时间
                 list_date_col = None
                 for col in ('list_date', 'listDate', 'ipo_date', 'ipoDate', '上市时间'):
@@ -523,7 +597,40 @@ class DataQueryService:
                         list_date_col = col
                         df = df.rename(columns={col: '上市时间'})
                         break
-                
+
+                # 处理行业分类字段
+                # 申万一级行业
+                found_l1 = False
+                for col in ('shenwan_industry_level1', 'shenwan_industry_l1', 'shenwan_l1', 'industry_level1', 'l1_industry'):
+                    if col in df.columns:
+                        df = df.rename(columns={col: '申万一级行业'})
+                        found_l1 = True
+                        break
+
+                # 申万二级行业
+                found_l2 = False
+                for col in ('shenwan_industry_level2', 'shenwan_industry_l2', 'shenwan_l2', 'industry_level2', 'l2_industry'):
+                    if col in df.columns:
+                        df = df.rename(columns={col: '申万二级行业'})
+                        found_l2 = True
+                        break
+
+                # 申万三级行业
+                found_l3 = False
+                for col in ('shenwan_industry_level3', 'shenwan_industry_l3', 'shenwan_l3', 'industry_level3', 'l3_industry'):
+                    if col in df.columns:
+                        df = df.rename(columns={col: '申万三级行业'})
+                        found_l3 = True
+                        break
+
+                # 通用行业
+                found_general = False
+                for col in ('general_industry', 'industry', 'main_industry'):
+                    if col in df.columns and col not in ('申万一级行业', '申万二级行业', '申万三级行业'):
+                        df = df.rename(columns={col: '通用行业'})
+                        found_general = True
+                        break
+
                 # 确保有基本的列
                 if '股票代码' not in df.columns:
                     df['股票代码'] = ''
@@ -533,26 +640,41 @@ class DataQueryService:
                     df['市场'] = '未知市场'
                 if '上市时间' not in df.columns:
                     df['上市时间'] = ''
-                
+
+                # 确保有行业分类列
+                if '申万一级行业' not in df.columns:
+                    df['申万一级行业'] = ''
+                if '申万二级行业' not in df.columns:
+                    df['申万二级行业'] = ''
+                if '申万三级行业' not in df.columns:
+                    df['申万三级行业'] = ''
+                if '通用行业' not in df.columns:
+                    df['通用行业'] = ''
+
                 # 修复市场信息：如果是"未知市场"，从代码推断
                 if df['市场'].eq('未知市场').any():
                     mask = df['市场'] == '未知市场'
                     df.loc[mask, '市场'] = df.loc[mask, '股票代码'].apply(self._infer_market_from_code)
-                
+
+                # 选择要返回的列
+                columns_to_keep = ['股票代码', '股票名称', '上市时间', '市场', '申万一级行业', '申万二级行业', '申万三级行业', '通用行业']
+                available_columns = [col for col in columns_to_keep if col in df.columns]
+                df = df[available_columns]
+
                 # 按股票代码排序
                 df = df.sort_values('股票代码').reset_index(drop=True)
-                
+
                 logger.info(f"成功获取 {len(df)} 只股票")
                 logger.info(f"市场分布: {df['市场'].value_counts().to_dict()}")
                 return df
             else:
                 logger.warning("采集器返回空股票列表")
                 return pd.DataFrame()
-                
+
         except Exception as e:
             logger.error(f"获取股票列表失败: {str(e)}", exc_info=True)
             # 如果采集器失败，返回基本的DataFrame结构
-            return pd.DataFrame(columns=['股票代码', '股票名称', '市场', '上市时间'])
+            return pd.DataFrame(columns=['股票代码', '股票名称', '市场', '上市时间', '申万一级行业', '申万二级行业', '申万三级行业', '通用行业'])
 
     def get_industry_options(self) -> List[str]:
         """获取行业筛选下拉框的候选项（申万一级行业）。
