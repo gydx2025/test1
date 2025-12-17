@@ -750,6 +750,54 @@ class RealEstateQueryApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出过程中发生错误：\n{str(e)}")
     
+    def reset_form(self):
+        """重置所有表单输入"""
+        try:
+            logger.info("开始重置表单")
+            
+            # 1. 清空已选择的科目
+            self.clear_selected_subjects()
+            
+            # 2. 重置时点选择 - 将所有日期编辑框重置为最小日期
+            empty_date = QDate(1900, 1, 1)
+            for date_edit in self.time_edits:
+                date_edit.setDate(empty_date)
+            
+            # 3. 清空查询输入
+            self.stock_code_input.clear()
+            self.stock_name_input.clear()
+            
+            # 4. 重置下拉框选择
+            # 市场选择重置为"全部"
+            for i in range(self.market_combo.count()):
+                if self.market_combo.itemText(i) == "全部":
+                    self.market_combo.setCurrentIndex(i)
+                    break
+            
+            # 行业选择重置为"全行业"
+            for i in range(self.industry_combo.count()):
+                if self.industry_combo.itemText(i) == "全行业":
+                    self.industry_combo.setCurrentIndex(i)
+                    break
+            
+            # 5. 清空查询结果表格
+            self.result_table.setModel(None)
+            self.current_data = pd.DataFrame()
+            
+            # 6. 重置状态
+            self.statusBar().showMessage("表单已重置")
+            self.export_button.setEnabled(False)
+            
+            # 7. 隐藏进度条
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setValue(0)
+            
+            logger.info("表单重置完成")
+            
+        except Exception as e:
+            logger.error(f"重置表单时出错: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "错误", f"重置表单时出错：\n{str(e)}")
+    
     def closeEvent(self, event):
         """关闭事件"""
         # 如果有正在运行的查询线程，先停止
